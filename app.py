@@ -4,15 +4,20 @@ from datetime import datetime, timedelta
 import json
 import os
 
-st.set_page_config(page_title="Pragati Enterprises CRM", layout="wide")
+st.set_page_config(page_title="Pragati Enterprises CRM & ERP", layout="wide")
 
-DATA_FILE = "crm_data.json"
+DATA_FILE = "pragati_erp_data.json"
 
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
-    return {"clients": [], "bills": [], "engineers": [], "advance_logs": [], "travel_logs": []}
+    return {
+        "clients": [], "vendors": [], "inventory": [], "categories": ["CCTV Surveillance", "Biometric & Access", "Intercom & EPABX", "Solar Systems", "Electrical Work"],
+        "inquiries": [], "calls": [], "work_details": [], "engineers": [], "advance_logs": [], "travel_logs": [],
+        "quotations": [], "challans": [], "purchase_orders": [], "credit_notes": [],
+        "terms": "1. 50% Advance at the time of order.\n2. Warranty covers manufacturing defects only.\n3. Taxes extra as applicable."
+    }
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
@@ -20,170 +25,131 @@ def save_data(data):
 
 data = load_data()
 
-st.title("⚡ Pragati Enterprises - Management Dashboard")
+st.title("⚡ Pragati Enterprises - Management Portal")
+st.caption("Palghar | CCTV, Biometric, Solar, Intercom & Electrical Services")
 
 menu = st.sidebar.selectbox("Navigation Menu", [
-    "Clients & Billing", 
-    "Engineers & Pay Structure", 
-    "Record Advance & Travel", 
-    "Salary Slip Generator"
+    "Dashboard", "Service Categories", "Inventory & Vendors", "Leads & Inquiries",
+    "Calls & Work Status", "Engineers & Salary", "Quotations & Documents", "Terms & Conditions"
 ])
 
-# ==================== CLIENTS & BILLING ====================
-if menu == "Clients & Billing":
-    st.header("📄 Billing & Service Reminders")
+# 1. DASHBOARD
+if menu == "Dashboard":
+    st.header("📌 System Overview")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Clients", len(data["clients"]))
+    col2.metric("Total Inquiries", len(data["inquiries"]))
+    col3.metric("Pending Calls", len([c for c in data["calls"] if c['status'] != 'Completed']))
+    col4.metric("Inventory Items", len(data["inventory"]))
+
+# 2. SERVICE CATEGORIES
+elif menu == "Service Categories":
+    st.header("🏷️ Service Categories")
+    new_cat = st.text_input("Add New Category Name")
+    if st.button("Add Category"):
+        if new_cat and new_cat not in data["categories"]:
+            data["categories"].append(new_cat)
+            save_data(data)
+            st.success(f"Category '{new_cat}' Added!")
+    st.write("Current Categories:", data["categories"])
+
+# 3. INVENTORY & VENDORS
+elif menu == "Inventory & Vendors":
+    tab1, tab2 = st.tabs(["📦 Inventory Management", "🏬 Vendor Management"])
+    with tab1:
+        st.subheader("Add Stock / Item")
+        item = st.text_input("Item Name (e.g. 2MP IP Camera)")
+        cat = st.selectbox("Category", data["categories"])
+        qty = st.number_input("Quantity", min_value=1)
+        rate = st.number_input("Purchase Rate", min_value=0.0)
+        if st.button("Save Item"):
+            data["inventory"].append({"item": item, "category": cat, "qty": qty, "rate": rate})
+            save_data(data)
+            st.success("Item Added to Stock!")
+        st.dataframe(pd.DataFrame(data["inventory"]))
     
-    tab1, tab2 = st.tabs(["+ Add Client / Create Bill", "View Existing Bills & Reminders"])
+    with tab2:
+        st.subheader("Add New Vendor")
+        vname = st.text_input("Vendor Company Name")
+        vphone = st.text_input("Contact Number")
+        vmat = st.text_input("Material Supplied")
+        if st.button("Save Vendor"):
+            data["vendors"].append({"name": vname, "phone": vphone, "material": vmat})
+            save_data(data)
+            st.success("Vendor Registered!")
+        st.dataframe(pd.DataFrame(data["vendors"]))
+
+# 4. LEADS & INQUIRIES
+elif menu == "Leads & Inquiries":
+    st.header("📞 New Inquiries & Lead Management")
+    cname = st.text_input("Client/Company Name")
+    cphone = st.text_input("Phone Number")
+    cloc = st.text_input("Location / City")
+    req = st.selectbox("Requirement Category", data["categories"])
+    notes = st.text_area("Requirement Details")
+    if st.button("Save Lead"):
+        data["inquiries"].append({"client": cname, "phone": cphone, "location": cloc, "category": req, "notes": notes, "date": str(datetime.now().date())})
+        save_data(data)
+        st.success("Inquiry Logged Successfully!")
+    st.dataframe(pd.DataFrame(data["inquiries"]))
+
+# 5. CALLS & WORK STATUS
+elif menu == "Calls & Work Status":
+    st.header("⚙️ Service Calls & Field Work Logs")
+    tab1, tab2 = st.tabs(["Create Call", "Engineer Work Status Updates"])
     
     with tab1:
-        st.subheader("Client Selection")
-        client_option = st.radio("Choose Action:", ["Select Existing Client", "Add New Client"])
-        
-        selected_client = None
-        if client_option == "Select Existing Client" and data["clients"]:
-            client_list = {f"{c['name']} ({c['city']})": c for c in data["clients"]}
-            chosen_name = st.selectbox("Select Client:", list(client_list.keys()))
-            selected_client = client_list[chosen_name]
-        else:
-            c_name = st.text_input("Client/Company Name")
-            c_phone = st.text_input("Phone Number")
-            c_city = st.text_input("City/Location")
-            if st.button("Save New Client"):
-                if c_name:
-                    new_c = {"id": len(data["clients"]) + 1, "name": c_name, "phone": c_phone, "city": c_city}
-                    data["clients"].append(new_c)
-                    save_data(data)
-                    st.success(f"Client {c_name} Added Successfully!")
-                    st.rerun()
-
-        st.divider()
-        st.subheader("Billing & AMC Cycle")
-        service = st.selectbox("Service Type", [
-            "HD/IP CCTV Camera Installation", 
-            "Biometric Attendance & Access Door Control", 
-            "Audio/Video Intercom Systems", 
-            "On-Grid / Off-Grid Solar Systems", 
-            "Electrical Repair Services"
-        ])
-        amount = st.number_input("Total Amount (INR)", min_value=0.0, step=500.0)
-        interval_choice = st.selectbox("AMC / Warranty Service Cycle", [
-            "3 Months Interval (4 Services/Year)", 
-            "4 Months Interval (3 Services/Year)"
-        ])
-        
-        if st.button("Generate Bill & Reminders"):
-            if selected_client and amount > 0:
-                interval = 3 if "3 Months" in interval_choice else 4
-                today = datetime.now()
-                reminders = []
-                for i in range(1, (12 // interval) + 1):
-                    due_date = today + timedelta(days=30 * interval * i)
-                    reminders.append({"service": f"Service #{i}", "due_date": due_date.strftime("%Y-%m-%d"), "status": "Pending"})
-                
-                bill = {
-                    "bill_id": len(data["bills"]) + 1,
-                    "client_id": selected_client["id"],
-                    "client_name": selected_client["name"],
-                    "service": service,
-                    "amount": amount,
-                    "date": today.strftime("%Y-%m-%d"),
-                    "amc_schedule": reminders
-                }
-                data["bills"].append(bill)
-                save_data(data)
-                st.success("Bill generated and AMC reminders scheduled successfully!")
-            else:
-                st.error("Please select a valid client and enter amount.")
-
-    with tab2:
-        if data["bills"]:
-            for b in data["bills"]:
-                with st.expander(f"Bill #{b['bill_id']} - {b['client_name']} (Rs. {b['amount']})"):
-                    st.write(f"**Service:** {b['service']}")
-                    st.write(f"**Date:** {b['date']}")
-                    st.write("**Scheduled Service Reminders:**")
-                    st.table(pd.DataFrame(b['amc_schedule']))
-        else:
-            st.info("No bills recorded yet.")
-
-# ==================== ENGINEERS & PAY STRUCTURE ====================
-elif menu == "Engineers & Pay Structure":
-    st.header("👷 Field Engineers Management")
-    
-    eng_name = st.text_input("Engineer Name")
-    pay_type = st.radio("Salary Type", ["Monthly Base", "Daily Base"])
-    rate = st.number_input("Pay Rate (INR)", min_value=0.0, step=100.0)
-    
-    if st.button("Add Engineer"):
-        if eng_name and rate > 0:
-            eng = {"id": len(data["engineers"]) + 1, "name": eng_name, "pay_type": pay_type.split()[0], "rate": rate}
-            data["engineers"].append(eng)
+        client = st.text_input("Client Name")
+        call_type = st.selectbox("Type", ["New Installation", "AMC Service", "Fault Repair"])
+        status = st.selectbox("Status", ["Scheduled", "In Progress", "Completed", "Pending Material"])
+        if st.button("Create Call"):
+            data["calls"].append({"client": client, "type": call_type, "status": status, "date": str(datetime.now().date())})
             save_data(data)
-            st.success(f"Engineer {eng_name} registered!")
-            st.rerun()
-
-    st.divider()
-    if data["engineers"]:
-        st.subheader("Registered Engineers")
-        st.dataframe(pd.DataFrame(data["engineers"]))
-
-# ==================== ADVANCE & TRAVEL ====================
-elif menu == "Record Advance & Travel":
-    st.header("💸 Daily Travel Expenses & Advance Payments")
-    
-    if data["engineers"]:
-        eng_list = {e['name']: e['id'] for e in data["engineers"]}
-        selected_eng = st.selectbox("Select Engineer", list(eng_list.keys()))
-        eng_id = eng_list[selected_eng]
-        
-        entry_type = st.radio("Entry Type", ["Advance Taken", "Daily Travel Expense"])
-        amt = st.number_input("Amount (INR)", min_value=0.0, step=50.0)
-        entry_date = st.date_input("Date", datetime.now())
-        
-        if st.button("Save Entry"):
-            if amt > 0:
-                record = {"eng_id": eng_id, "amount": amt, "date": str(entry_date)}
-                if entry_type == "Advance Taken":
-                    data["advance_logs"].append(record)
-                    st.success("Advance payment recorded!")
-                else:
-                    data["travel_logs"].append(record)
-                    st.success("Travel expense recorded!")
-                save_data(data)
-            else:
-                st.warning("Please enter a valid amount.")
-    else:
-        st.info("Please add engineers first.")
-
-# ==================== SALARY SLIP ====================
-elif menu == "Salary Slip Generator":
-    st.header("🧾 Monthly Salary Slip Generator")
-    
-    if data["engineers"]:
-        eng_list = {f"{e['name']} ({e['pay_type']})": e for e in data["engineers"]}
-        selected_eng_key = st.selectbox("Select Engineer", list(eng_list.keys()))
-        eng = eng_list[selected_eng_key]
-        eid = eng["id"]
-        
-        days_worked = 30
-        if eng["pay_type"] == "Daily":
-            days_worked = st.number_input("Days Worked This Month", min_value=1, max_value=31, value=26)
-            base_salary = eng["rate"] * days_worked
-        else:
-            base_salary = eng["rate"]
+            st.success("Call Created!")
             
-        total_advance = sum(x["amount"] for x in data["advance_logs"] if x["eng_id"] == eid)
-        total_travel = sum(x["amount"] for x in data["travel_logs"] if x["eng_id"] == eid)
-        net_payable = base_salary + total_travel - total_advance
-        
-        st.divider()
-        st.markdown(f"""
-        ### PRAGATI ENTERPRISES - SALARY SLIP
-        * **Engineer Name:** {eng['name']}
-        * **Pay Type:** {eng['pay_type']} Base
-        * **Base Salary ({days_worked} days):** Rs. {base_salary:.2f}
-        * **(+) Travel Allowance:** Rs. {total_travel:.2f}
-        * **(-) Advance Deductions:** Rs. {total_advance:.2f}
-        ---
-        ### **NET PAYABLE AMOUNT: Rs. {net_payable:.2f}**
-        """)
+    with tab2:
+        eng_name = st.text_input("Engineer Name")
+        work_done = st.text_area("Work Details / Parts Replaced")
+        travel_exp = st.number_input("Daily Travel Expense (₹)", min_value=0.0)
+        if st.button("Submit Daily Report"):
+            data["work_details"].append({"engineer": eng_name, "work": work_done, "travel": travel_exp, "date": str(datetime.now().date())})
+            save_data(data)
+            st.success("Work Log Saved!")
+
+# 6. ENGINEERS & SALARY
+elif menu == "Engineers & Salary":
+    st.header("👷 Engineers & Payroll Management")
+    ename = st.text_input("Engineer Name")
+    ptype = st.selectbox("Pay Type", ["Monthly", "Daily Base"])
+    rate = st.number_input("Base Pay Rate (₹)", min_value=0.0)
+    if st.button("Add Engineer"):
+        data["engineers"].append({"name": ename, "pay_type": ptype, "rate": rate})
+        save_data(data)
+        st.success("Engineer Onboarded!")
+    st.dataframe(pd.DataFrame(data["engineers"]))
+
+# 7. QUOTATIONS & DOCUMENTS
+elif menu == "Quotations & Documents":
+    st.header("📄 Billing & Document Generation")
+    doc_type = st.selectbox("Select Document Type", ["Quotation", "Delivery Challan", "Purchase Order (PO)", "Credit Note"])
+    client_name = st.text_input("Client / Vendor Name")
+    item_desc = st.text_area("Itemization / Scope of Work")
+    amount = st.number_input("Total Amount (₹)", min_value=0.0)
+    
+    st.subheader("Terms & Conditions Included:")
+    st.info(data["terms"])
+    
+    if st.button("Generate Document"):
+        doc_entry = {"type": doc_type, "party": client_name, "details": item_desc, "amount": amount, "date": str(datetime.now().date())}
+        data["quotations"].append(doc_entry)
+        save_data(data)
+        st.success(f"{doc_type} Generated Successfully!")
+
+# 8. TERMS & CONDITIONS
+elif menu == "Terms & Conditions":
+    st.header("📝 Global Terms & Conditions Setup")
+    updated_terms = st.text_area("Edit Master Terms & Conditions", data["terms"], height=200)
+    if st.button("Update Terms"):
+        data["terms"] = updated_terms
+        save_data(data)
+        st.success("Terms & Conditions Updated!")
