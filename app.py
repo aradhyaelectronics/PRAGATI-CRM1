@@ -1936,7 +1936,6 @@ elif menu == "Inventory":
                 item_code,
                 item_name,
                 category,
-                category,
                 unit,
                 quantity,
                 min_stock,
