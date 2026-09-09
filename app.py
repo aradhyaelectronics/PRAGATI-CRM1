@@ -4,6 +4,16 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 import calendar
 import hashlib
+from io import BytesIO
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+)
 
 # ============================================================
 # PRAGATI CRM - COMPLETE SERVICE & WORKFORCE SOFTWARE
@@ -61,6 +71,239 @@ def now():
 
 def money(v):
     return f"₹{float(v or 0):,.2f}"
+
+
+# ============================================================
+# PRINTABLE PDF HELPERS
+# ============================================================
+
+def _pdf_text(value):
+    """Safe text for ReportLab; keep Indian currency printable everywhere."""
+    if value is None:
+        return ""
+    text = str(value)
+    return text.replace("₹", "Rs. ").replace("\n", "<br/>")
+
+
+def _pdf_money(value):
+    try:
+        return f"Rs. {float(value or 0):,.2f}"
+    except Exception:
+        return "Rs. 0.00"
+
+
+def make_printable_pdf(title, meta, sections, terms="", footer_note=""):
+    """Create a clean A4 PDF that can be downloaded and printed."""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=14*mm,
+        leftMargin=14*mm,
+        topMargin=14*mm,
+        bottomMargin=16*mm,
+        title=title,
+        author=str(settings["company_name"] if "settings" in globals() and settings else "Pragati CRM"),
+    )
+
+    styles = getSampleStyleSheet()
+    company_style = ParagraphStyle(
+        "Company", parent=styles["Heading1"], fontName="Helvetica-Bold",
+        fontSize=17, leading=20, alignment=TA_CENTER, spaceAfter=2*mm
+    )
+    title_style = ParagraphStyle(
+        "DocTitle", parent=styles["Heading2"], fontName="Helvetica-Bold",
+        fontSize=13, leading=16, alignment=TA_CENTER, spaceAfter=4*mm
+    )
+    normal = ParagraphStyle(
+        "NormalPDF", parent=styles["BodyText"], fontName="Helvetica",
+        fontSize=9.2, leading=12
+    )
+    small = ParagraphStyle(
+        "SmallPDF", parent=normal, fontSize=8, leading=10
+    )
+    right = ParagraphStyle(
+        "RightPDF", parent=normal, alignment=TA_RIGHT
+    )
+
+    story = []
+    company = settings["company_name"] if "settings" in globals() and settings else "Pragati Enterprises"
+    address = settings["address"] if "settings" in globals() and settings else ""
+    phone = settings["phone"] if "settings" in globals() and settings else ""
+    email = settings["email"] if "settings" in globals() and settings else ""
+    gst_no = settings["gst"] if "settings" in globals() and settings else ""
+
+    story.append(Paragraph(_pdf_text(company), company_style))
+    contact_parts = [x for x in [address, phone, email, (f"GST: {gst_no}" if gst_no else "")] if x]
+    if contact_parts:
+        story.append(Paragraph(" | ".join(_pdf_text(x) for x in contact_parts), small))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph(_pdf_text(title), title_style))
+
+    if meta:
+        rows = []
+        for i in range(0, len(meta), 2):
+            left = meta[i]
+            right_item = meta[i+1] if i+1 < len(meta) else ("", "")
+            rows.append([
+                Paragraph(f"<b>{_pdf_text(left[0])}</b><br/>{_pdf_text(left[1])}", normal),
+                Paragraph(f"<b>{_pdf_text(right_item[0])}</b><br/>{_pdf_text(right_item[1])}", normal),
+            ])
+        t=Table(rows, colWidths=[89*mm, 89*mm], hAlign="LEFT")
+        t.setStyle(TableStyle([
+            ("BOX",(0,0),(-1,-1),0.6,colors.grey),
+            ("INNERGRID",(0,0),(-1,-1),0.3,colors.lightgrey),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("LEFTPADDING",(0,0),(-1,-1),5),
+            ("RIGHTPADDING",(0,0),(-1,-1),5),
+            ("TOPPADDING",(0,0),(-1,-1),5),
+            ("BOTTOMPADDING",(0,0),(-1,-1),5),
+        ]))
+        story.append(t)
+        story.append(Spacer(1, 4*mm))
+
+    for section_title, content in sections:
+        if section_title:
+            story.append(Paragraph(_pdf_text(section_title), ParagraphStyle(
+                "Section", parent=styles["Heading3"], fontName="Helvetica-Bold",
+                fontSize=10.5, leading=13, spaceBefore=2*mm, spaceAfter=1.5*mm
+            )))
+        if isinstance(content, list) and content and isinstance(content[0], (list, tuple)):
+            data=[]
+            for row in content:
+                data.append([Paragraph(_pdf_text(cell), normal) for cell in row])
+            col_count=max(len(r) for r in content)
+            widths=[178*mm/col_count]*col_count
+            t=Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+            t.setStyle(TableStyle([
+                ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#eeeeee")),
+                ("TEXTCOLOR",(0,0),(-1,0),colors.black),
+                ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+                ("GRID",(0,0),(-1,-1),0.45,colors.grey),
+                ("VALIGN",(0,0),(-1,-1),"TOP"),
+                ("LEFTPADDING",(0,0),(-1,-1),4),
+                ("RIGHTPADDING",(0,0),(-1,-1),4),
+                ("TOPPADDING",(0,0),(-1,-1),4),
+                ("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ]))
+            story.append(t)
+        else:
+            story.append(Paragraph(_pdf_text(content), normal))
+        story.append(Spacer(1, 2*mm))
+
+    if terms:
+        story.append(Spacer(1, 2*mm))
+        story.append(Paragraph("Terms & Conditions", ParagraphStyle(
+            "TC", parent=styles["Heading3"], fontName="Helvetica-Bold", fontSize=10.5
+        )))
+        story.append(Paragraph(_pdf_text(terms), small))
+
+    story.append(Spacer(1, 9*mm))
+    sign = Table([["Prepared By", "Customer / Authorized Signatory"]], colWidths=[89*mm,89*mm])
+    sign.setStyle(TableStyle([
+        ("LINEABOVE",(0,0),(-1,0),0.5,colors.grey),
+        ("ALIGN",(0,0),(-1,-1),"CENTER"),
+        ("TOPPADDING",(0,0),(-1,-1),4),
+    ]))
+    story.append(sign)
+    if footer_note:
+        story.append(Spacer(1, 3*mm))
+        story.append(Paragraph(_pdf_text(footer_note), small))
+
+    def footer(canvas, doc_obj):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawString(14*mm, 8*mm, _pdf_text(company))
+        canvas.drawRightString(A4[0]-14*mm, 8*mm, f"Page {doc_obj.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buffer.getvalue()
+
+
+def service_call_pdf(row):
+    return make_printable_pdf(
+        "SERVICE REPORT",
+        [("Report No.", row["call_no"]), ("Date", row["call_date"]),
+         ("Client", row["client"]), ("Engineer", row["engineer"]),
+         ("Site / Location", row["site"]), ("Visit Date", row["scheduled_date"])],
+        [
+            ("Service Details", [["Field", "Details"],
+             ["Complaint / Requirement", row["complaint"]],
+             ["Priority", row["priority"]], ["Status", row["status"]],
+             ["Material Used", row["material"]], ["Remarks", row["remarks"]],
+             ["Customer Feedback", row["customer_feedback"]]]),
+        ],
+        settings["service_terms"] if settings else "",
+        "Service report generated from Pragati CRM."
+    )
+
+
+def quotation_pdf(row):
+    taxable=float(row["subtotal"] or 0)-float(row["discount"] or 0)
+    gst=float(row["gst"] or 0)
+    return make_printable_pdf(
+        "QUOTATION",
+        [("Quotation No.", row["quotation_no"]), ("Date", row["quotation_date"]),
+         ("Client", row["client"]), ("Status", row["status"])],
+        [("Quotation Summary", [["Description", "Amount"],
+          ["Subtotal", _pdf_money(row["subtotal"])],
+          ["Discount", _pdf_money(row["discount"])],
+          ["Taxable Amount", _pdf_money(taxable)],
+          ["GST", _pdf_money(gst)],
+          ["Grand Total", _pdf_money(row["total"])]]),
+         ("Remarks", row["remarks"] or "")],
+        row["terms"] or ""
+    )
+
+
+def challan_pdf(row):
+    return make_printable_pdf(
+        "DELIVERY CHALLAN",
+        [("Challan No.", row["challan_no"]), ("Date", row["challan_date"]),
+         ("Client", row["client"]), ("Status", row["status"])],
+        [("Material Details", [["Material / Item", "Quantity", "Returnable"],
+          [row["item"], row["quantity"], row["returnable"]]]),
+         ("Remarks", row["remarks"] or "")],
+        settings["challan_terms"] if settings else ""
+    )
+
+
+def invoice_pdf(row):
+    taxable=float(row["subtotal"] or 0)-float(row["discount"] or 0)
+    return make_printable_pdf(
+        "TAX INVOICE",
+        [("Invoice No.", row["invoice_no"]), ("Invoice Date", row["invoice_date"]),
+         ("Client", row["client"]), ("Status", row["status"])],
+        [("Invoice Summary", [["Description", "Amount"],
+          ["Subtotal", _pdf_money(row["subtotal"])],
+          ["Discount", _pdf_money(row["discount"])],
+          ["Taxable Amount", _pdf_money(taxable)],
+          ["GST", _pdf_money(row["gst"])],
+          ["Grand Total", _pdf_money(row["total"])],
+          ["Amount Received", _pdf_money(row["paid"])],
+          ["Balance Due", _pdf_money(row["balance"])]]) ,
+         ("Remarks", row["remarks"] or "")],
+        row["terms"] or ""
+    )
+
+
+def salary_pdf(row):
+    return make_printable_pdf(
+        "SALARY SLIP",
+        [("Salary Month", row["salary_month"]), ("Employee", row["engineer"]),
+         ("Salary Type", row["salary_type"]), ("Status", row["status"])],
+        [("Attendance & Salary", [["Particular", "Value"],
+          ["Working Days", row["working_days"]], ["Present Days", row["present_days"]],
+          ["Absent Days", row["absent_days"]], ["OT Hours", f"{float(row['ot_hours'] or 0):.2f}"],
+          ["Basic Salary", _pdf_money(row["basic_salary"])],
+          ["OT Amount", _pdf_money(row["ot_amount"])],
+          ["Advance", _pdf_money(row["advance"])],
+          ["Deduction", _pdf_money(row["deduction"])],
+          ["Gross Salary", _pdf_money(row["gross_salary"])],
+          ["Net Salary", _pdf_money(row["net_salary"])]] )],
+        ""
+    )
 
 
 # ============================================================
@@ -1094,6 +1337,20 @@ elif menu == "Service Calls":
 
     st.dataframe(df, use_container_width=True)
 
+    if len(df):
+        st.subheader("🖨️ Printable Service Report PDF")
+        service_options = [f"{r.call_no} | {r.client} | {r.call_date}" for _, r in df.iterrows()]
+        service_selected = st.selectbox("Select service call to print", service_options, key="print_service_report")
+        service_row = df.iloc[service_options.index(service_selected)]
+        st.download_button(
+            "🖨️ Download / Print Service Report PDF",
+            service_call_pdf(service_row),
+            f"service_report_{service_row['call_no']}.pdf",
+            "application/pdf",
+            use_container_width=True,
+            key="download_service_report_pdf"
+        )
+
 
 # ============================================================
 # ATTENDANCE IN / OUT
@@ -1733,24 +1990,31 @@ elif menu == "Quotation":
 
     st.divider()
 
-    st.dataframe(
-        query("""
-            SELECT
-                q.quotation_no,
-                c.name client,
-                q.quotation_date,
-                q.subtotal,
-                q.discount,
-                q.gst,
-                q.total,
-                q.status
-            FROM quotations q
-            LEFT JOIN clients c
-                ON q.client_id=c.id
-            ORDER BY q.id DESC
-        """),
-        use_container_width=True
-    )
+    quotation_list = query("""
+        SELECT q.*, c.name client
+        FROM quotations q
+        LEFT JOIN clients c ON q.client_id=c.id
+        ORDER BY q.id DESC
+    """)
+
+    st.dataframe(quotation_list[[
+        "quotation_no", "client", "quotation_date", "subtotal",
+        "discount", "gst", "total", "status"
+    ]] if len(quotation_list) else quotation_list, use_container_width=True)
+
+    if len(quotation_list):
+        st.subheader("🖨️ Printable Quotation PDF")
+        q_options = [f"{r.quotation_no} | {r.client} | {r.quotation_date}" for _, r in quotation_list.iterrows()]
+        q_selected = st.selectbox("Select quotation to print", q_options, key="print_quotation")
+        q_row = quotation_list.iloc[q_options.index(q_selected)]
+        st.download_button(
+            "🖨️ Download / Print Quotation PDF",
+            quotation_pdf(q_row),
+            f"quotation_{q_row['quotation_no']}.pdf",
+            "application/pdf",
+            use_container_width=True,
+            key="download_quotation_pdf"
+        )
 
 
 # ============================================================
@@ -1843,23 +2107,31 @@ elif menu == "Challan":
 
     st.divider()
 
-    st.dataframe(
-        query("""
-            SELECT
-                ch.challan_no,
-                c.name client,
-                ch.challan_date,
-                ch.item,
-                ch.quantity,
-                ch.returnable,
-                ch.status
-            FROM challans ch
-            LEFT JOIN clients c
-                ON ch.client_id=c.id
-            ORDER BY ch.id DESC
-        """),
-        use_container_width=True
-    )
+    challan_list = query("""
+        SELECT ch.*, c.name client
+        FROM challans ch
+        LEFT JOIN clients c ON ch.client_id=c.id
+        ORDER BY ch.id DESC
+    """)
+
+    st.dataframe(challan_list[[
+        "challan_no", "client", "challan_date", "item",
+        "quantity", "returnable", "status"
+    ]] if len(challan_list) else challan_list, use_container_width=True)
+
+    if len(challan_list):
+        st.subheader("🖨️ Printable Delivery Challan PDF")
+        ch_options = [f"{r.challan_no} | {r.client} | {r.challan_date}" for _, r in challan_list.iterrows()]
+        ch_selected = st.selectbox("Select challan to print", ch_options, key="print_challan")
+        ch_row = challan_list.iloc[ch_options.index(ch_selected)]
+        st.download_button(
+            "🖨️ Download / Print Challan PDF",
+            challan_pdf(ch_row),
+            f"challan_{ch_row['challan_no']}.pdf",
+            "application/pdf",
+            use_container_width=True,
+            key="download_challan_pdf"
+        )
 
 
 # ============================================================
@@ -1998,23 +2270,31 @@ elif menu == "Bill / Invoice":
 
     st.divider()
 
-    st.dataframe(
-        query("""
-            SELECT
-                i.invoice_no,
-                c.name client,
-                i.invoice_date,
-                i.total,
-                i.paid,
-                i.balance,
-                i.status
-            FROM invoices i
-            LEFT JOIN clients c
-                ON i.client_id=c.id
-            ORDER BY i.id DESC
-        """),
-        use_container_width=True
-    )
+    invoice_list = query("""
+        SELECT i.*, c.name client
+        FROM invoices i
+        LEFT JOIN clients c ON i.client_id=c.id
+        ORDER BY i.id DESC
+    """)
+
+    st.dataframe(invoice_list[[
+        "invoice_no", "client", "invoice_date", "total",
+        "paid", "balance", "status"
+    ]] if len(invoice_list) else invoice_list, use_container_width=True)
+
+    if len(invoice_list):
+        st.subheader("🖨️ Printable Bill / Invoice PDF")
+        inv_options = [f"{r.invoice_no} | {r.client} | {r.invoice_date}" for _, r in invoice_list.iterrows()]
+        inv_selected = st.selectbox("Select invoice to print", inv_options, key="print_invoice")
+        inv_row = invoice_list.iloc[inv_options.index(inv_selected)]
+        st.download_button(
+            "🖨️ Download / Print Bill PDF",
+            invoice_pdf(inv_row),
+            f"invoice_{inv_row['invoice_no']}.pdf",
+            "application/pdf",
+            use_container_width=True,
+            key="download_invoice_pdf"
+        )
 
 
 # ============================================================
@@ -2486,28 +2766,32 @@ elif menu == "Salary / Payroll":
 
     st.subheader("Salary History")
 
-    st.dataframe(
-        query("""
-            SELECT
-                s.salary_month,
-                e.name engineer,
-                s.salary_type,
-                s.present_days,
-                s.absent_days,
-                s.ot_hours,
-                s.basic_salary,
-                s.ot_amount,
-                s.advance,
-                s.deduction,
-                s.net_salary,
-                s.status
-            FROM salary s
-            LEFT JOIN engineers e
-                ON s.engineer_id=e.id
-            ORDER BY s.id DESC
-        """),
-        use_container_width=True
-    )
+    salary_history = query("""
+        SELECT s.*, e.name engineer
+        FROM salary s
+        LEFT JOIN engineers e ON s.engineer_id=e.id
+        ORDER BY s.id DESC
+    """)
+
+    st.dataframe(salary_history[[
+        "salary_month", "engineer", "salary_type", "present_days",
+        "absent_days", "ot_hours", "basic_salary", "ot_amount",
+        "advance", "deduction", "net_salary", "status"
+    ]] if len(salary_history) else salary_history, use_container_width=True)
+
+    if len(salary_history):
+        st.subheader("🖨️ Printable Salary Slip PDF")
+        sal_options = [f"{r.salary_month} | {r.engineer} | {money(r.net_salary)}" for _, r in salary_history.iterrows()]
+        sal_selected = st.selectbox("Select salary slip to print", sal_options, key="print_salary")
+        sal_row = salary_history.iloc[sal_options.index(sal_selected)]
+        st.download_button(
+            "🖨️ Download / Print Salary Slip PDF",
+            salary_pdf(sal_row),
+            f"salary_slip_{sal_row['engineer']}_{sal_row['salary_month']}.pdf",
+            "application/pdf",
+            use_container_width=True,
+            key="download_salary_pdf"
+        )
 
 
 # ============================================================
