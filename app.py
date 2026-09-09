@@ -6,14 +6,8 @@ import calendar
 import hashlib
 from io import BytesIO
 
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_RIGHT
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import mm
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-)
+# ReportLab is loaded lazily inside the PDF generator so the CRM can still start
+# if a deployment has not installed the optional PDF dependency yet.
 
 # ============================================================
 # PRAGATI CRM - COMPLETE SERVICE & WORKFORCE SOFTWARE
@@ -74,6 +68,86 @@ def money(v):
 
 
 # ============================================================
+# WHATSAPP CLOUD API
+# ============================================================
+
+def _setting_value(key, default=""):
+    try:
+        return settings[key] if settings and key in settings.keys() and settings[key] is not None else default
+    except Exception:
+        return default
+
+def normalize_whatsapp_number(value):
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if digits.startswith("00"):
+        digits = digits[2:]
+    # India-friendly default: 10 digit mobile -> 91XXXXXXXXXX
+    if len(digits) == 10:
+        digits = "91" + digits
+    return digits
+
+def whatsapp_configured():
+    try:
+        token = st.secrets.get("WHATSAPP_ACCESS_TOKEN", "")
+    except Exception:
+        token = ""
+    token = token or _setting_value("whatsapp_access_token", "")
+    phone_id = _setting_value("whatsapp_phone_number_id", "")
+    enabled = int(_setting_value("whatsapp_enabled", 0) or 0) == 1
+    return enabled and bool(token and phone_id), token, phone_id
+
+def whatsapp_send_template(to, template_name, params=None, language=None):
+    """Send an approved WhatsApp template. Returns (ok, message/error)."""
+    configured, token, phone_id = whatsapp_configured()
+    if not configured:
+        return False, "WhatsApp is not configured/enabled."
+    recipient = normalize_whatsapp_number(to)
+    if not recipient:
+        return False, "Recipient WhatsApp number is missing."
+    if not template_name:
+        return False, "WhatsApp template name is missing."
+    try:
+        import requests
+        version = _setting_value("whatsapp_api_version", "v23.0") or "v23.0"
+        if not str(version).startswith("v"):
+            version = "v" + str(version)
+        lang = language or _setting_value("whatsapp_language", "en_US") or "en_US"
+        body_params = [{"type": "text", "text": str(x)} for x in (params or [])]
+        template = {"name": str(template_name).strip(), "language": {"code": lang}}
+        if body_params:
+            template["components"] = [{"type": "body", "parameters": body_params}]
+        url = f"https://graph.facebook.com/{version}/{phone_id}/messages"
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": recipient,
+                "type": "template",
+                "template": template,
+            },
+            timeout=20,
+        )
+        data = response.json() if response.content else {}
+        if response.ok:
+            return True, data.get("messages", [{}])[0].get("id", "Sent")
+        return False, data.get("error", {}).get("message", response.text[:300])
+    except Exception as exc:
+        return False, str(exc)
+
+def whatsapp_notify(event_key, recipient, params=None):
+    enabled_key = f"whatsapp_notify_{event_key}"
+    if int(_setting_value(enabled_key, 1) or 0) != 1:
+        return False, "Notification disabled."
+    template_key = f"whatsapp_template_{event_key}"
+    template = _setting_value(template_key, "")
+    if not template:
+        return False, f"Template not configured for {event_key}."
+    return whatsapp_send_template(recipient, template, params=params)
+
+
+# ============================================================
 # PRINTABLE PDF HELPERS
 # ============================================================
 
@@ -94,6 +168,18 @@ def _pdf_money(value):
 
 def make_printable_pdf(title, meta, sections, terms="", footer_note=""):
     """Create a clean A4 PDF that can be downloaded and printed."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PDF support is not installed. Add 'reportlab' to requirements.txt and reboot the Streamlit app."
+        ) from exc
+
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -295,7 +381,9 @@ def salary_pdf(row):
          ("Salary Type", row["salary_type"]), ("Status", row["status"])],
         [("Attendance & Salary", [["Particular", "Value"],
           ["Working Days", row["working_days"]], ["Present Days", row["present_days"]],
-          ["Absent Days", row["absent_days"]], ["OT Hours", f"{float(row['ot_hours'] or 0):.2f}"],
+          ["Absent Days", row["absent_days"]], ["Total Working Hours", f"{float(row.get('total_hours', 0) or 0):.2f}"],
+          ["OT Hours", f"{float(row['ot_hours'] or 0):.2f}"],
+          ["OT Rate / Hour", _pdf_money(row.get('ot_rate', 0))],
           ["Basic Salary", _pdf_money(row["basic_salary"])],
           ["OT Amount", _pdf_money(row["ot_amount"])],
           ["Advance", _pdf_money(row["advance"])],
@@ -327,7 +415,23 @@ def init_db():
         invoice_terms TEXT,
         quotation_terms TEXT,
         challan_terms TEXT,
-        service_terms TEXT
+        service_terms TEXT,
+        whatsapp_enabled INTEGER DEFAULT 0,
+        whatsapp_phone_number_id TEXT,
+        whatsapp_access_token TEXT,
+        whatsapp_api_version TEXT DEFAULT 'v23.0',
+        whatsapp_language TEXT DEFAULT 'en_US',
+        whatsapp_notify_punch INTEGER DEFAULT 1,
+        whatsapp_notify_salary INTEGER DEFAULT 1,
+        whatsapp_notify_service INTEGER DEFAULT 1,
+        whatsapp_notify_invoice INTEGER DEFAULT 1,
+        whatsapp_notify_amc INTEGER DEFAULT 1,
+        whatsapp_template_punch_in TEXT DEFAULT 'attendance_in',
+        whatsapp_template_punch_out TEXT DEFAULT 'attendance_out',
+        whatsapp_template_salary TEXT DEFAULT 'salary_generated',
+        whatsapp_template_service TEXT DEFAULT 'service_assigned',
+        whatsapp_template_invoice TEXT DEFAULT 'invoice_generated',
+        whatsapp_template_amc TEXT DEFAULT 'amc_reminder'
     );
 
     CREATE TABLE IF NOT EXISTS admins (
@@ -367,6 +471,10 @@ def init_db():
         salary_type TEXT DEFAULT 'Monthly',
         salary REAL DEFAULT 0,
         daily_rate REAL DEFAULT 0,
+        working_days REAL DEFAULT 26,
+        standard_hours REAL DEFAULT 8,
+        ot_rate REAL DEFAULT 0,
+        ot_multiplier REAL DEFAULT 1.5,
         joining_date TEXT,
         address TEXT,
         active INTEGER DEFAULT 1,
@@ -519,7 +627,9 @@ def init_db():
         present_days REAL DEFAULT 0,
         absent_days REAL DEFAULT 0,
         ot_hours REAL DEFAULT 0,
+        ot_rate REAL DEFAULT 0,
         ot_amount REAL DEFAULT 0,
+        total_hours REAL DEFAULT 0,
         advance REAL DEFAULT 0,
         deduction REAL DEFAULT 0,
         gross_salary REAL DEFAULT 0,
@@ -572,6 +682,22 @@ def init_db():
             "quotation_terms": "TEXT",
             "challan_terms": "TEXT",
             "service_terms": "TEXT",
+            "whatsapp_enabled": "INTEGER DEFAULT 0",
+            "whatsapp_phone_number_id": "TEXT",
+            "whatsapp_access_token": "TEXT",
+            "whatsapp_api_version": "TEXT DEFAULT 'v23.0'",
+            "whatsapp_language": "TEXT DEFAULT 'en_US'",
+            "whatsapp_notify_punch": "INTEGER DEFAULT 1",
+            "whatsapp_notify_salary": "INTEGER DEFAULT 1",
+            "whatsapp_notify_service": "INTEGER DEFAULT 1",
+            "whatsapp_notify_invoice": "INTEGER DEFAULT 1",
+            "whatsapp_notify_amc": "INTEGER DEFAULT 1",
+            "whatsapp_template_punch_in": "TEXT DEFAULT 'attendance_in'",
+            "whatsapp_template_punch_out": "TEXT DEFAULT 'attendance_out'",
+            "whatsapp_template_salary": "TEXT DEFAULT 'salary_generated'",
+            "whatsapp_template_service": "TEXT DEFAULT 'service_assigned'",
+            "whatsapp_template_invoice": "TEXT DEFAULT 'invoice_generated'",
+            "whatsapp_template_amc": "TEXT DEFAULT 'amc_reminder'",
         },
         "admins": {
             "username": "TEXT",
@@ -603,6 +729,10 @@ def init_db():
             "salary_type": "TEXT DEFAULT 'Monthly'",
             "salary": "REAL DEFAULT 0",
             "daily_rate": "REAL DEFAULT 0",
+            "working_days": "REAL DEFAULT 26",
+            "standard_hours": "REAL DEFAULT 8",
+            "ot_rate": "REAL DEFAULT 0",
+            "ot_multiplier": "REAL DEFAULT 1.5",
             "joining_date": "TEXT",
             "address": "TEXT",
             "active": "INTEGER DEFAULT 1",
@@ -732,7 +862,9 @@ def init_db():
             "present_days": "REAL DEFAULT 0",
             "absent_days": "REAL DEFAULT 0",
             "ot_hours": "REAL DEFAULT 0",
+            "ot_rate": "REAL DEFAULT 0",
             "ot_amount": "REAL DEFAULT 0",
+            "total_hours": "REAL DEFAULT 0",
             "advance": "REAL DEFAULT 0",
             "deduction": "REAL DEFAULT 0",
             "gross_salary": "REAL DEFAULT 0",
@@ -1116,7 +1248,44 @@ elif menu == "Engineer / Technician":
         daily_rate = st.number_input(
             "Daily Rate",
             min_value=0.0,
-            step=100.0
+            step=100.0,
+            help="Used when Salary Type is Daily."
+        )
+
+        c1,c2,c3 = st.columns(3)
+
+        working_days = c1.number_input(
+            "Salary Working Days / Month",
+            min_value=1.0,
+            max_value=31.0,
+            value=26.0,
+            step=1.0,
+            help="For monthly salary calculation. Example: 26 working days."
+        )
+
+        standard_hours = c2.number_input(
+            "Standard Hours / Day",
+            min_value=1.0,
+            max_value=24.0,
+            value=8.0,
+            step=0.5
+        )
+
+        ot_rate = c3.number_input(
+            "OT Rate / Hour",
+            min_value=0.0,
+            value=0.0,
+            step=10.0,
+            help="Keep 0 for automatic 1.5x hourly rate."
+        )
+
+        ot_multiplier = st.number_input(
+            "Automatic OT Multiplier",
+            min_value=1.0,
+            max_value=5.0,
+            value=1.5,
+            step=0.5,
+            help="Used only when OT Rate / Hour is 0."
         )
 
         joining_date = st.date_input(
@@ -1141,8 +1310,9 @@ elif menu == "Engineer / Technician":
                     INSERT INTO engineers
                     (name,mobile,email,designation,
                      salary_type,salary,daily_rate,
+                     working_days,standard_hours,ot_rate,ot_multiplier,
                      joining_date,address,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     name,
                     mobile,
@@ -1151,6 +1321,10 @@ elif menu == "Engineer / Technician":
                     salary_type,
                     salary,
                     daily_rate,
+                    working_days,
+                    standard_hours,
+                    ot_rate,
+                    ot_multiplier,
                     str(joining_date),
                     address,
                     now()
@@ -1170,6 +1344,10 @@ elif menu == "Engineer / Technician":
             salary_type,
             salary,
             daily_rate,
+            working_days,
+            standard_hours,
+            ot_rate,
+            ot_multiplier,
             joining_date,
             CASE
                 WHEN active=1 THEN 'Active'
@@ -1458,6 +1636,13 @@ elif menu == "Attendance IN / OUT":
             st.success(
                 f"IN Punch: {current_time}"
             )
+            eng = one("SELECT name,mobile FROM engineers WHERE id=?", (engineer_id,))
+            if eng and eng["mobile"]:
+                ok, msg = whatsapp_notify("punch_in", eng["mobile"], [eng["name"], str(attendance_date), current_time])
+                if ok:
+                    st.info("WhatsApp IN notification sent.")
+                elif whatsapp_configured()[0] and "Template not configured" not in msg:
+                    st.warning(f"WhatsApp notification: {msg}")
 
             st.rerun()
 
@@ -1521,6 +1706,13 @@ elif menu == "Attendance IN / OUT":
                     f"OUT Punch: {current_time} | "
                     f"Working Hours: {hours:.2f}"
                 )
+                eng = one("SELECT name,mobile FROM engineers WHERE id=?", (engineer_id,))
+                if eng and eng["mobile"]:
+                    ok, msg = whatsapp_notify("punch_out", eng["mobile"], [eng["name"], str(attendance_date), current_time, f"{hours:.2f}"])
+                    if ok:
+                        st.info("WhatsApp OUT notification sent.")
+                    elif whatsapp_configured()[0] and "Template not configured" not in msg:
+                        st.warning(f"WhatsApp notification: {msg}")
 
                 st.rerun()
 
@@ -2549,221 +2741,190 @@ elif menu == "Auto Adjustment":
 elif menu == "Salary / Payroll":
 
     st.title("💵 Salary / Payroll")
+    st.caption("Automatic salary from IN/OUT attendance, present days and daily OT.")
 
     engineers = query("""
         SELECT
-            id,
-            name,
-            salary_type,
-            salary,
-            daily_rate
+            id,name,salary_type,salary,daily_rate,
+            working_days,standard_hours,ot_rate,ot_multiplier
         FROM engineers
         WHERE active=1
         ORDER BY name
     """)
 
-    if len(engineers)==0:
-
-        st.warning(
-            "First add engineer."
-        )
-
+    if len(engineers) == 0:
+        st.warning("First add engineer.")
     else:
-
-        engineer_map = dict(
-            zip(engineers["name"],engineers["id"])
-        )
-
-        engineer_name = st.selectbox(
-            "Engineer",
-            list(engineer_map.keys())
-        )
-
+        engineer_map = dict(zip(engineers["name"], engineers["id"]))
+        engineer_name = st.selectbox("Engineer", list(engineer_map.keys()))
         engineer_id = engineer_map[engineer_name]
+        eng = engineers[engineers["id"] == engineer_id].iloc[0]
 
-        eng = engineers[
-            engineers["id"]==engineer_id
-        ].iloc[0]
-
-        salary_type = st.selectbox(
+        c1,c2 = st.columns(2)
+        salary_type = c1.selectbox(
             "Salary Calculation",
-            [
-                "Monthly",
-                "Daily"
-            ]
+            ["Monthly", "Daily"],
+            index=0 if str(eng["salary_type"] or "Monthly") == "Monthly" else 1
         )
+        salary_month = c2.date_input("Salary Month", date.today())
 
-        salary_month = st.date_input(
-            "Salary Month",
-            date.today()
-        )
+        year, month = salary_month.year, salary_month.month
+        days_in_month = calendar.monthrange(year, month)[1]
 
-        year = salary_month.year
-        month = salary_month.month
-
-        days_in_month = calendar.monthrange(
-            year,
-            month
-        )[1]
-
-        attendance = query("""
-            SELECT
-                attendance_date,
-                hours,
-                status
-            FROM attendance
-            WHERE engineer_id=?
-            AND substr(attendance_date,1,7)=?
-        """, (
-            engineer_id,
-            f"{year:04d}-{month:02d}"
-        ))
-
-        present_days = len(
-            attendance[
-                attendance["status"]=="Present"
-            ]
-        )
-
-        absent_days = max(
-            days_in_month-present_days,
-            0
-        )
-
-        total_hours = (
-            attendance["hours"]
-            .fillna(0)
-            .sum()
-            if len(attendance)
-            else 0
-        )
-
-        standard_hours = present_days * 8
-
-        ot_hours = max(
-            total_hours-standard_hours,
-            0
-        )
-
-        if salary_type=="Daily":
-
-            daily_rate = float(
-                eng["daily_rate"] or 0
-            )
-
-            basic_salary = (
-                present_days*daily_rate
-            )
-
-        else:
-
-            monthly_salary = float(
-                eng["salary"] or 0
-            )
-
-            basic_salary = (
-                monthly_salary
-                * present_days
-                / days_in_month
-            )
-
-        ot_rate = st.number_input(
-            "OT Rate / Hour",
-            min_value=0.0,
-            value=0.0
-        )
-
-        ot_amount = ot_hours*ot_rate
-
-        advance = st.number_input(
-            "Advance",
-            min_value=0.0
-        )
-
-        deduction = st.number_input(
-            "Other Deduction",
-            min_value=0.0
-        )
-
-        gross_salary = (
-            basic_salary+ot_amount
-        )
-
-        net_salary = max(
-            gross_salary-
-            advance-
-            deduction,
-            0
-        )
+        configured_working_days = float(eng["working_days"] or 26)
+        standard_hours = float(eng["standard_hours"] or 8)
+        stored_ot_rate = float(eng["ot_rate"] or 0)
+        ot_multiplier = float(eng["ot_multiplier"] or 1.5)
 
         c1,c2,c3,c4 = st.columns(4)
-
-        c1.metric(
-            "Present",
-            present_days
+        working_day_basis = c1.number_input(
+            "Working Days Basis",
+            min_value=1.0,
+            max_value=float(days_in_month),
+            value=min(configured_working_days, float(days_in_month)),
+            step=1.0,
+            help="Monthly salary is prorated against this number of working days."
+        )
+        day_hours = c2.number_input(
+            "Standard Hours / Day",
+            min_value=1.0,
+            max_value=24.0,
+            value=standard_hours,
+            step=0.5
+        )
+        ot_rate = c3.number_input(
+            "OT Rate / Hour",
+            min_value=0.0,
+            value=stored_ot_rate,
+            step=10.0,
+            help="0 = automatic hourly rate × OT multiplier."
+        )
+        ot_mult = c4.number_input(
+            "OT Multiplier",
+            min_value=1.0,
+            max_value=5.0,
+            value=ot_multiplier,
+            step=0.5
         )
 
-        c2.metric(
-            "Absent",
-            absent_days
-        )
+        attendance = query("""
+            SELECT attendance_date,in_time,out_time,hours,status,remarks
+            FROM attendance
+            WHERE engineer_id=?
+              AND substr(attendance_date,1,7)=?
+            ORDER BY attendance_date
+        """, (engineer_id, f"{year:04d}-{month:02d}"))
 
-        c3.metric(
-            "OT Hours",
-            f"{ot_hours:.2f}"
-        )
+        present_days = int((attendance["status"] == "Present").sum()) if len(attendance) else 0
+        total_hours = float(attendance["hours"].fillna(0).sum()) if len(attendance) else 0.0
 
-        c4.metric(
-            "Net Salary",
-            money(net_salary)
-        )
+        # OT is calculated day-by-day, so a short day cannot cancel OT from another day.
+        ot_hours = 0.0
+        if len(attendance):
+            for _, a in attendance.iterrows():
+                if str(a.get("status", "")) == "Present":
+                    ot_hours += max(float(a.get("hours", 0) or 0) - day_hours, 0.0)
+
+        absent_days = max(working_day_basis - present_days, 0.0)
+
+        if salary_type == "Daily":
+            daily_rate = float(eng["daily_rate"] or 0)
+            basic_salary = present_days * daily_rate
+            salary_basis_text = f"{present_days} × {money(daily_rate)}"
+        else:
+            monthly_salary = float(eng["salary"] or 0)
+            basic_salary = monthly_salary * min(present_days, working_day_basis) / working_day_basis
+            salary_basis_text = f"{money(monthly_salary)} ÷ {working_day_basis:g} × {present_days}"
+
+        if ot_rate > 0:
+            effective_ot_rate = ot_rate
+            ot_source = "Fixed OT rate"
+        else:
+            hourly_base = (basic_salary / max(present_days * day_hours, 1)) if salary_type == "Daily" else (float(eng["salary"] or 0) / max(working_day_basis * day_hours, 1))
+            effective_ot_rate = hourly_base * ot_mult
+            ot_source = f"Automatic {ot_mult:g}× hourly rate"
+
+        ot_amount = ot_hours * effective_ot_rate
+
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("Present", present_days)
+        c2.metric("Absent", f"{absent_days:g}")
+        c3.metric("Total Hours", f"{total_hours:.2f}")
+        c4.metric("OT Hours", f"{ot_hours:.2f}")
+        c5.metric("OT Amount", money(ot_amount))
 
         st.info(
-            f"Basic: {money(basic_salary)} | "
-            f"OT: {money(ot_amount)} | "
-            f"Advance: {money(advance)} | "
-            f"Deduction: {money(deduction)}"
+            f"Salary basis: {salary_basis_text} | "
+            f"OT: {money(effective_ot_rate)}/hour ({ot_source})"
         )
 
-        if st.button(
-            "💾 Generate Salary",
-            use_container_width=True
-        ):
+        # Attendance details for verification before salary generation.
+        with st.expander("📋 Attendance details", expanded=False):
+            if len(attendance):
+                view = attendance.copy()
+                view["OT Hours"] = view.apply(
+                    lambda r: max(float(r["hours"] or 0) - day_hours, 0.0) if r["status"] == "Present" else 0.0,
+                    axis=1
+                )
+                st.dataframe(view, use_container_width=True)
+            else:
+                st.warning("No attendance punch found for this month.")
 
-            execute("""
-                INSERT INTO salary
-                (engineer_id,salary_month,salary_type,
-                 basic_salary,working_days,present_days,
-                 absent_days,ot_hours,ot_amount,
-                 advance,deduction,gross_salary,
-                 net_salary,status,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                engineer_id,
-                f"{year:04d}-{month:02d}",
-                salary_type,
-                basic_salary,
-                days_in_month,
-                present_days,
-                absent_days,
-                ot_hours,
-                ot_amount,
-                advance,
-                deduction,
-                gross_salary,
-                net_salary,
-                "Pending",
-                now()
-            ))
+        advance = st.number_input("Advance", min_value=0.0, step=100.0)
+        deduction = st.number_input("Other Deduction", min_value=0.0, step=100.0)
 
-            st.success(
-                f"Salary generated: {money(net_salary)}"
+        gross_salary = basic_salary + ot_amount
+        net_salary = max(gross_salary - advance - deduction, 0.0)
+
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Basic Salary", money(basic_salary))
+        c2.metric("Gross Salary", money(gross_salary))
+        c3.metric("Net Salary", money(net_salary))
+
+        if st.button("💾 Generate / Update Salary", type="primary", use_container_width=True):
+            existing_salary = one("""
+                SELECT id FROM salary
+                WHERE engineer_id=? AND salary_month=?
+                ORDER BY id DESC LIMIT 1
+            """, (engineer_id, f"{year:04d}-{month:02d}"))
+
+            values = (
+                salary_type, basic_salary, working_day_basis, present_days,
+                absent_days, ot_hours, effective_ot_rate, ot_amount, total_hours,
+                advance, deduction, gross_salary, net_salary, "Pending"
             )
 
+            if existing_salary:
+                execute("""
+                    UPDATE salary SET
+                        salary_type=?, basic_salary=?, working_days=?, present_days=?,
+                        absent_days=?, ot_hours=?, ot_rate=?, ot_amount=?, total_hours=?,
+                        advance=?, deduction=?, gross_salary=?, net_salary=?, status=?, created_at=?
+                    WHERE id=?
+                """, values + (now(), int(existing_salary["id"])))
+                st.success(f"Salary updated: {money(net_salary)}")
+            else:
+                execute("""
+                    INSERT INTO salary
+                    (engineer_id,salary_month,salary_type,basic_salary,working_days,
+                     present_days,absent_days,ot_hours,ot_rate,ot_amount,total_hours,
+                     advance,deduction,gross_salary,net_salary,status,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (engineer_id, f"{year:04d}-{month:02d}") + values + (now(),))
+                st.success(f"Salary generated: {money(net_salary)}")
+            eng_phone = one("SELECT name,mobile FROM engineers WHERE id=?", (engineer_id,))
+            if eng_phone and eng_phone["mobile"]:
+                ok, msg = whatsapp_notify(
+                    "salary", eng_phone["mobile"],
+                    [eng_phone["name"], f"{year:04d}-{month:02d}", f"{present_days:g}", f"{ot_hours:.2f}", f"{net_salary:.2f}"]
+                )
+                if ok:
+                    st.info("WhatsApp salary notification sent.")
+                elif whatsapp_configured()[0] and "Template not configured" not in msg:
+                    st.warning(f"WhatsApp notification: {msg}")
             st.rerun()
 
     st.divider()
-
     st.subheader("Salary History")
 
     salary_history = query("""
@@ -2774,9 +2935,9 @@ elif menu == "Salary / Payroll":
     """)
 
     st.dataframe(salary_history[[
-        "salary_month", "engineer", "salary_type", "present_days",
-        "absent_days", "ot_hours", "basic_salary", "ot_amount",
-        "advance", "deduction", "net_salary", "status"
+        "salary_month", "engineer", "salary_type", "working_days", "present_days",
+        "absent_days", "total_hours", "ot_hours", "ot_rate", "basic_salary", "ot_amount",
+        "advance", "deduction", "gross_salary", "net_salary", "status"
     ]] if len(salary_history) else salary_history, use_container_width=True)
 
     if len(salary_history):
@@ -2867,6 +3028,45 @@ elif menu == "Admin T&C":
         height=150
     )
 
+    st.divider()
+    st.subheader("📲 WhatsApp Cloud API Notifications")
+    st.caption("Use an approved Meta WhatsApp template for business-initiated notifications. Keep the access token in Streamlit Secrets when possible.")
+    wa_enabled = st.checkbox("Enable WhatsApp notifications", value=bool(_setting_value("whatsapp_enabled", 0)))
+    c1,c2,c3 = st.columns(3)
+    wa_phone_id = c1.text_input("Phone Number ID", _setting_value("whatsapp_phone_number_id", ""))
+    wa_api_version = c2.text_input("Graph API Version", _setting_value("whatsapp_api_version", "v23.0"))
+    wa_language = c3.text_input("Template Language", _setting_value("whatsapp_language", "en_US"))
+    wa_token = st.text_input("Access Token (prefer Streamlit Secrets)", _setting_value("whatsapp_access_token", ""), type="password")
+    if wa_enabled and not wa_token:
+        st.info("Recommended: add WHATSAPP_ACCESS_TOKEN in Streamlit Cloud → Settings → Secrets.")
+    st.markdown("**Notification templates** (these names must match approved WhatsApp templates)")
+    c1,c2 = st.columns(2)
+    wa_t_in = c1.text_input("IN Punch template", _setting_value("whatsapp_template_punch_in", "attendance_in"))
+    wa_t_out = c2.text_input("OUT Punch template", _setting_value("whatsapp_template_punch_out", "attendance_out"))
+    c1,c2 = st.columns(2)
+    wa_t_salary = c1.text_input("Salary template", _setting_value("whatsapp_template_salary", "salary_generated"))
+    wa_t_service = c2.text_input("Service Call template", _setting_value("whatsapp_template_service", "service_assigned"))
+    c1,c2 = st.columns(2)
+    wa_t_invoice = c1.text_input("Invoice template", _setting_value("whatsapp_template_invoice", "invoice_generated"))
+    wa_t_amc = c2.text_input("AMC template", _setting_value("whatsapp_template_amc", "amc_reminder"))
+    c1,c2,c3,c4,c5 = st.columns(5)
+    wa_n_punch = c1.checkbox("Punch", value=bool(_setting_value("whatsapp_notify_punch", 1)))
+    wa_n_salary = c2.checkbox("Salary", value=bool(_setting_value("whatsapp_notify_salary", 1)))
+    wa_n_service = c3.checkbox("Service", value=bool(_setting_value("whatsapp_notify_service", 1)))
+    wa_n_invoice = c4.checkbox("Invoice", value=bool(_setting_value("whatsapp_notify_invoice", 1)))
+    wa_n_amc = c5.checkbox("AMC", value=bool(_setting_value("whatsapp_notify_amc", 1)))
+
+    test_number = st.text_input("Test WhatsApp number", placeholder="10-digit Indian mobile or full country code")
+    if st.button("📲 SEND TEST WHATSAPP", use_container_width=True):
+        ok, msg = whatsapp_send_template(
+            test_number, wa_t_in or "hello_world",
+            ["Test Employee", str(date.today()), datetime.now().strftime("%H:%M:%S")]
+        )
+        if ok:
+            st.success("Test WhatsApp message sent successfully.")
+        else:
+            st.error(f"WhatsApp test failed: {msg}")
+
     if st.button(
         "💾 SAVE ADMIN SETTINGS",
         type="primary",
@@ -2883,7 +3083,23 @@ elif menu == "Admin T&C":
                 invoice_terms=?,
                 quotation_terms=?,
                 challan_terms=?,
-                service_terms=?
+                service_terms=?,
+                whatsapp_enabled=?,
+                whatsapp_phone_number_id=?,
+                whatsapp_access_token=?,
+                whatsapp_api_version=?,
+                whatsapp_language=?,
+                whatsapp_notify_punch=?,
+                whatsapp_notify_salary=?,
+                whatsapp_notify_service=?,
+                whatsapp_notify_invoice=?,
+                whatsapp_notify_amc=?,
+                whatsapp_template_punch_in=?,
+                whatsapp_template_punch_out=?,
+                whatsapp_template_salary=?,
+                whatsapp_template_service=?,
+                whatsapp_template_invoice=?,
+                whatsapp_template_amc=?
             WHERE id=1
         """, (
             company_name,
@@ -2894,7 +3110,10 @@ elif menu == "Admin T&C":
             invoice_terms,
             quotation_terms,
             challan_terms,
-            service_terms
+            service_terms,
+            int(wa_enabled), wa_phone_id, wa_token, wa_api_version, wa_language,
+            int(wa_n_punch), int(wa_n_salary), int(wa_n_service), int(wa_n_invoice), int(wa_n_amc),
+            wa_t_in, wa_t_out, wa_t_salary, wa_t_service, wa_t_invoice, wa_t_amc
         ))
 
         st.success(
