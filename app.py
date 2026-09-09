@@ -20,6 +20,26 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# ============================================================
+# MODERN UI THEME
+# ============================================================
+st.markdown("""
+<style>
+[data-testid="stSidebar"] { min-width: 290px; max-width: 330px; }
+[data-testid="stSidebar"] * { font-size: 17px !important; }
+[data-testid="stSidebar"] .stRadio label { padding: 7px 4px; font-weight: 600; }
+.stButton > button, .stDownloadButton > button, button[kind="primary"] {
+    border-radius: 10px !important; min-height: 46px !important;
+    font-weight: 700 !important; font-size: 16px !important;
+}
+.stButton > button { background: linear-gradient(135deg,#2563eb,#7c3aed) !important; color: white !important; border: 0 !important; }
+.stDownloadButton > button { background: linear-gradient(135deg,#059669,#0d9488) !important; color: white !important; border: 0 !important; }
+.stButton > button:hover, .stDownloadButton > button:hover { transform: translateY(-1px); filter: brightness(1.08); }
+div[data-testid="stMetric"] { border: 1px solid rgba(128,128,128,.22); border-radius: 12px; padding: 10px; }
+div[data-testid="stDataFrame"] { border-radius: 10px; }
+</style>
+""", unsafe_allow_html=True)
+
 DB = "pragati_crm.db"
 
 
@@ -146,6 +166,79 @@ def whatsapp_notify(event_key, recipient, params=None):
         return False, f"Template not configured for {event_key}."
     return whatsapp_send_template(recipient, template, params=params)
 
+
+# ============================================================
+# DOCUMENT LINE ITEMS / PRODUCTS
+# ============================================================
+def get_inventory_products():
+    return query("""
+        SELECT id,item_code,item_name,unit,quantity,purchase_rate,selling_rate
+        FROM inventory ORDER BY item_name
+    """)
+
+def document_items(document_type, document_id):
+    return query("""
+        SELECT di.*, i.item_code
+        FROM document_items di
+        LEFT JOIN inventory i ON i.id=di.item_id
+        WHERE di.document_type=? AND di.document_id=?
+        ORDER BY di.id
+    """, (document_type, int(document_id)))
+
+def save_document_items(document_type, document_id, items):
+    execute("DELETE FROM document_items WHERE document_type=? AND document_id=?", (document_type, int(document_id)))
+    for item in items:
+        name = str(item.get("item_name", "")).strip()
+        qty = float(item.get("quantity", 0) or 0)
+        rate = float(item.get("rate", 0) or 0)
+        if not name or qty <= 0:
+            continue
+        amount = qty * rate
+        execute("""
+            INSERT INTO document_items
+            (document_type,document_id,item_id,item_name,description,quantity,unit,rate,gst_rate,amount,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """, (document_type, int(document_id), item.get("item_id"), name, item.get("description", ""),
+              qty, item.get("unit", "Nos"), rate, float(item.get("gst_rate", 0) or 0), amount, now()))
+
+def product_editor(key, include_gst=True):
+    products = get_inventory_products()
+    if len(products):
+        names = ["-- Select Product --"] + products["item_name"].tolist()
+        st.caption("Add products/materials from Inventory or enter a custom item.")
+        choice = st.selectbox("Product", names, key=f"prod_choice_{key}")
+        if choice != "-- Select Product --":
+            r = products[products["item_name"] == choice].iloc[0]
+            defaults = pd.DataFrame([{"Item": r["item_name"], "Description": "", "Qty": 1.0, "Unit": r["unit"] or "Nos", "Rate": float(r["selling_rate"] or 0), "GST %": 18.0 if include_gst else 0.0}])
+        else:
+            defaults = pd.DataFrame([{"Item": "", "Description": "", "Qty": 1.0, "Unit": "Nos", "Rate": 0.0, "GST %": 18.0 if include_gst else 0.0}])
+    else:
+        defaults = pd.DataFrame([{"Item": "", "Description": "", "Qty": 1.0, "Unit": "Nos", "Rate": 0.0, "GST %": 18.0 if include_gst else 0.0}])
+    edited = st.data_editor(defaults, num_rows="dynamic", use_container_width=True, key=f"items_{key}", column_config={
+        "Qty": st.column_config.NumberColumn("Qty", min_value=0.01, step=1.0),
+        "Rate": st.column_config.NumberColumn("Rate", min_value=0.0, step=10.0),
+        "GST %": st.column_config.NumberColumn("GST %", min_value=0.0, max_value=100.0, step=1.0)
+    })
+    return edited
+
+def normalize_items_dataframe(edited, products=None):
+    rows=[]
+    products = products if products is not None else get_inventory_products()
+    for _, r in edited.iterrows():
+        name=str(r.get("Item", "") or "").strip()
+        qty=float(r.get("Qty", 0) or 0)
+        if not name or qty <= 0: continue
+        match=products[products["item_name"]==name] if len(products) else pd.DataFrame()
+        item_id=int(match.iloc[0]["id"]) if len(match) else None
+        rows.append({"item_id": item_id, "item_name": name, "description": str(r.get("Description", "") or ""),
+                     "quantity": qty, "unit": str(r.get("Unit", "Nos") or "Nos"), "rate": float(r.get("Rate", 0) or 0),
+                     "gst_rate": float(r.get("GST %", 0) or 0)})
+    return rows
+
+def line_items_totals(items):
+    subtotal=sum(float(x["quantity"])*float(x["rate"]) for x in items)
+    gst=sum(float(x["quantity"])*float(x["rate"])*float(x.get("gst_rate",0) or 0)/100 for x in items)
+    return subtotal, gst
 
 # ============================================================
 # PRINTABLE PDF HELPERS
@@ -326,52 +419,36 @@ def service_call_pdf(row):
 
 
 def quotation_pdf(row):
+    items = document_items("quotation", int(row["id"]))
+    item_rows = [["Item", "Qty", "Unit", "Rate", "Amount"]]
+    for _, x in items.iterrows():
+        item_rows.append([x["item_name"], x["quantity"], x["unit"], _pdf_money(x["rate"]), _pdf_money(x["amount"])])
     taxable=float(row["subtotal"] or 0)-float(row["discount"] or 0)
     gst=float(row["gst"] or 0)
-    return make_printable_pdf(
-        "QUOTATION",
-        [("Quotation No.", row["quotation_no"]), ("Date", row["quotation_date"]),
-         ("Client", row["client"]), ("Status", row["status"])],
-        [("Quotation Summary", [["Description", "Amount"],
-          ["Subtotal", _pdf_money(row["subtotal"])],
-          ["Discount", _pdf_money(row["discount"])],
-          ["Taxable Amount", _pdf_money(taxable)],
-          ["GST", _pdf_money(gst)],
-          ["Grand Total", _pdf_money(row["total"])]]),
-         ("Remarks", row["remarks"] or "")],
-        row["terms"] or ""
-    )
+    sections=[]
+    if len(item_rows)>1: sections.append(("Products / Services", item_rows))
+    sections += [("Quotation Summary", [["Description", "Amount"], ["Subtotal", _pdf_money(row["subtotal"])], ["Discount", _pdf_money(row["discount"])], ["Taxable Amount", _pdf_money(taxable)], ["GST", _pdf_money(gst)], ["Grand Total", _pdf_money(row["total"])] ]), ("Remarks", row["remarks"] or "")]
+    return make_printable_pdf("QUOTATION", [("Quotation No.", row["quotation_no"]), ("Date", row["quotation_date"]), ("Client", row["client"]), ("Status", row["status"])], sections, row["terms"] or "")
 
 
 def challan_pdf(row):
-    return make_printable_pdf(
-        "DELIVERY CHALLAN",
-        [("Challan No.", row["challan_no"]), ("Date", row["challan_date"]),
-         ("Client", row["client"]), ("Status", row["status"])],
-        [("Material Details", [["Material / Item", "Quantity", "Returnable"],
-          [row["item"], row["quantity"], row["returnable"]]]),
-         ("Remarks", row["remarks"] or "")],
-        settings["challan_terms"] if settings else ""
-    )
+    items = document_items("challan", int(row["id"]))
+    item_rows=[["Material / Item", "Qty", "Unit", "Returnable"]]
+    if len(items):
+        for _,x in items.iterrows(): item_rows.append([x["item_name"], x["quantity"], x["unit"], row["returnable"]])
+    else: item_rows.append([row["item"], row["quantity"], "Nos", row["returnable"]])
+    return make_printable_pdf("DELIVERY CHALLAN", [("Challan No.", row["challan_no"]), ("Date", row["challan_date"]), ("Client", row["client"]), ("Status", row["status"])], [("Material Details", item_rows), ("Remarks", row["remarks"] or "")], settings["challan_terms"] if settings else "")
 
 
 def invoice_pdf(row):
+    items = document_items("invoice", int(row["id"]))
+    item_rows=[["Item", "Qty", "Unit", "Rate", "Amount"]]
+    for _,x in items.iterrows(): item_rows.append([x["item_name"],x["quantity"],x["unit"],_pdf_money(x["rate"]),_pdf_money(x["amount"])])
     taxable=float(row["subtotal"] or 0)-float(row["discount"] or 0)
-    return make_printable_pdf(
-        "TAX INVOICE",
-        [("Invoice No.", row["invoice_no"]), ("Invoice Date", row["invoice_date"]),
-         ("Client", row["client"]), ("Status", row["status"])],
-        [("Invoice Summary", [["Description", "Amount"],
-          ["Subtotal", _pdf_money(row["subtotal"])],
-          ["Discount", _pdf_money(row["discount"])],
-          ["Taxable Amount", _pdf_money(taxable)],
-          ["GST", _pdf_money(row["gst"])],
-          ["Grand Total", _pdf_money(row["total"])],
-          ["Amount Received", _pdf_money(row["paid"])],
-          ["Balance Due", _pdf_money(row["balance"])]]) ,
-         ("Remarks", row["remarks"] or "")],
-        row["terms"] or ""
-    )
+    sections=[]
+    if len(item_rows)>1: sections.append(("Products / Services", item_rows))
+    sections += [("Invoice Summary", [["Description", "Amount"], ["Subtotal", _pdf_money(row["subtotal"])], ["Discount", _pdf_money(row["discount"])], ["Taxable Amount", _pdf_money(taxable)], ["GST", _pdf_money(row["gst"])], ["Grand Total", _pdf_money(row["total"])], ["Amount Received", _pdf_money(row["paid"])], ["Balance Due", _pdf_money(row["balance"])] ]), ("Remarks", row["remarks"] or "")]
+    return make_printable_pdf("TAX INVOICE", [("Invoice No.", row["invoice_no"]), ("Invoice Date", row["invoice_date"]), ("Client", row["client"]), ("Status", row["status"])], sections, row["terms"] or "")
 
 
 def salary_pdf(row):
@@ -592,6 +669,21 @@ def init_db():
         created_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS document_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_type TEXT NOT NULL,
+        document_id INTEGER NOT NULL,
+        item_id INTEGER,
+        item_name TEXT NOT NULL,
+        description TEXT,
+        quantity REAL DEFAULT 1,
+        unit TEXT DEFAULT 'Nos',
+        rate REAL DEFAULT 0,
+        gst_rate REAL DEFAULT 0,
+        amount REAL DEFAULT 0,
+        created_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS payments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         client_id INTEGER,
@@ -599,6 +691,38 @@ def init_db():
         payment_date TEXT,
         amount REAL DEFAULT 0,
         mode TEXT,
+        remarks TEXT,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS purchases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        purchase_no TEXT,
+        vendor_id INTEGER,
+        purchase_date TEXT,
+        item_id INTEGER,
+        item_name TEXT NOT NULL,
+        quantity REAL DEFAULT 1,
+        unit TEXT DEFAULT 'Nos',
+        rate REAL DEFAULT 0,
+        gst_rate REAL DEFAULT 0,
+        gst_amount REAL DEFAULT 0,
+        subtotal REAL DEFAULT 0,
+        total REAL DEFAULT 0,
+        payment_mode TEXT DEFAULT 'Credit',
+        remarks TEXT,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        expense_no TEXT,
+        expense_date TEXT,
+        category TEXT,
+        description TEXT,
+        amount REAL DEFAULT 0,
+        payment_mode TEXT DEFAULT 'Cash',
+        reference TEXT,
         remarks TEXT,
         created_at TEXT
     );
@@ -832,6 +956,19 @@ def init_db():
             "terms": "TEXT",
             "created_at": "TEXT",
         },
+        "document_items": {
+            "document_type": "TEXT",
+            "document_id": "INTEGER",
+            "item_id": "INTEGER",
+            "item_name": "TEXT",
+            "description": "TEXT",
+            "quantity": "REAL DEFAULT 1",
+            "unit": "TEXT DEFAULT 'Nos'",
+            "rate": "REAL DEFAULT 0",
+            "gst_rate": "REAL DEFAULT 0",
+            "amount": "REAL DEFAULT 0",
+            "created_at": "TEXT",
+        },
         "payments": {
             "client_id": "INTEGER",
             "invoice_no": "TEXT",
@@ -840,6 +977,18 @@ def init_db():
             "mode": "TEXT",
             "remarks": "TEXT",
             "created_at": "TEXT",
+        },
+        "purchases": {
+            "purchase_no": "TEXT", "vendor_id": "INTEGER", "purchase_date": "TEXT",
+            "item_id": "INTEGER", "item_name": "TEXT", "quantity": "REAL DEFAULT 1",
+            "unit": "TEXT DEFAULT 'Nos'", "rate": "REAL DEFAULT 0", "gst_rate": "REAL DEFAULT 0",
+            "gst_amount": "REAL DEFAULT 0", "subtotal": "REAL DEFAULT 0", "total": "REAL DEFAULT 0",
+            "payment_mode": "TEXT DEFAULT 'Credit'", "remarks": "TEXT", "created_at": "TEXT",
+        },
+        "expenses": {
+            "expense_no": "TEXT", "expense_date": "TEXT", "category": "TEXT",
+            "description": "TEXT", "amount": "REAL DEFAULT 0", "payment_mode": "TEXT DEFAULT 'Cash'",
+            "reference": "TEXT", "remarks": "TEXT", "created_at": "TEXT",
         },
         "credit_notes": {
             "credit_no": "TEXT",
@@ -985,6 +1134,9 @@ menu = st.sidebar.radio(
         "Quotation",
         "Challan",
         "Bill / Invoice",
+        "Payment Collection",
+        "Purchase Entry",
+        "Expenses",
         "Credit Note",
         "Auto Adjustment",
         "Salary / Payroll",
@@ -1056,6 +1208,21 @@ if menu == "Dashboard":
     c6.metric("Low Stock", low_stock)
     c7.metric("Outstanding", money(outstanding))
 
+    month_start = date.today().replace(day=1).isoformat()
+    month_key = date.today().strftime("%Y-%m")
+    month_sales = float(one("SELECT COALESCE(SUM(MAX(subtotal-discount,0)),0) v FROM invoices WHERE substr(invoice_date,1,7)=?", (month_key,))["v"] or 0)
+    month_purchase = float(one("SELECT COALESCE(SUM(subtotal),0) v FROM purchases WHERE substr(purchase_date,1,7)=?", (month_key,))["v"] or 0)
+    month_expenses = float(one("SELECT COALESCE(SUM(amount),0) v FROM expenses WHERE substr(expense_date,1,7)=?", (month_key,))["v"] or 0)
+    month_salary = float(one("SELECT COALESCE(SUM(gross_salary),0) v FROM salary WHERE substr(salary_month,1,7)=?", (month_key,))["v"] or 0)
+    month_profit = month_sales - month_purchase - month_expenses - month_salary
+    month_collection = float(one("SELECT COALESCE(SUM(amount),0) v FROM payments WHERE substr(payment_date,1,7)=?", (month_key,))["v"] or 0)
+    f1,f2,f3,f4,f5 = st.columns(5)
+    f1.metric("Month Sales", money(month_sales))
+    f2.metric("Month Purchase", money(month_purchase))
+    f3.metric("Month Expenses", money(month_expenses))
+    f4.metric("Month Collection", money(month_collection))
+    f5.metric("Estimated Profit", money(month_profit))
+
     st.divider()
 
     st.subheader("🔔 AMC Alerts")
@@ -1111,48 +1278,33 @@ elif menu == "Client Registration":
     st.title("👤 Client Registration")
 
     with st.form("client"):
-
         c1,c2 = st.columns(2)
-
         name = c1.text_input("Client / Company Name *")
         contact = c1.text_input("Mobile")
         email = c2.text_input("Email")
         gst = c2.text_input("GST")
-
         address = st.text_area("Address")
-
-        save = st.form_submit_button(
-            "Save Client",
-            use_container_width=True
-        )
-
+        save = st.form_submit_button("➕ Save Client", use_container_width=True)
         if save:
-
-            if not name:
-                st.error("Client name required.")
+            if not name.strip(): st.error("Client name required.")
             else:
+                execute("INSERT INTO clients (name,contact,email,gst,address,created_at) VALUES(?,?,?,?,?,?)", (name.strip(),contact,email,gst,address,now()))
+                st.success("Client added."); st.rerun()
 
-                execute("""
-                    INSERT INTO clients
-                    (name,contact,email,gst,address,created_at)
-                    VALUES(?,?,?,?,?,?)
-                """, (
-                    name,contact,email,gst,address,now()
-                ))
-
-                st.success("Client added.")
-                st.rerun()
-
-    st.divider()
-
-    st.dataframe(
-        query("""
-            SELECT id,name,contact,email,gst,address
-            FROM clients
-            ORDER BY id DESC
-        """),
-        use_container_width=True
-    )
+    st.divider(); st.subheader("✏️ Edit Client")
+    client_df=query("SELECT * FROM clients ORDER BY name")
+    if len(client_df):
+        cmap={f"{r['name']} | {r['contact'] or '-'}":int(r['id']) for _,r in client_df.iterrows()}
+        selected=st.selectbox("Select Client", list(cmap.keys()), key="edit_client_select")
+        cid=cmap[selected]; r=client_df[client_df.id==cid].iloc[0]
+        with st.form("edit_client"):
+            e1,e2=st.columns(2); ename=e1.text_input("Name",r["name"] or ""); econtact=e1.text_input("Mobile",r["contact"] or ""); eemail=e2.text_input("Email",r["email"] or ""); egst=e2.text_input("GST",r["gst"] or ""); eaddress=st.text_area("Address",r["address"] or "")
+            b1,b2=st.columns(2); update=b1.form_submit_button("💾 Update Client",use_container_width=True); delete=b2.form_submit_button("🗑️ Delete Client",use_container_width=True)
+            if update:
+                execute("UPDATE clients SET name=?,contact=?,email=?,gst=?,address=? WHERE id=?",(ename,econtact,eemail,egst,eaddress,cid)); st.success("Client updated."); st.rerun()
+            if delete:
+                execute("DELETE FROM clients WHERE id=?",(cid,)); st.success("Client deleted."); st.rerun()
+    st.dataframe(query("SELECT id,name,contact,email,gst,address FROM clients ORDER BY id DESC"),use_container_width=True)
 
 
 # ============================================================
@@ -1162,50 +1314,22 @@ elif menu == "Client Registration":
 elif menu == "Vendor Registration":
 
     st.title("🏭 Vendor Registration")
-
     with st.form("vendor"):
-
-        c1,c2 = st.columns(2)
-
-        name = c1.text_input("Vendor Name *")
-        contact = c1.text_input("Mobile")
-        email = c2.text_input("Email")
-        gst = c2.text_input("GST")
-
-        address = st.text_area("Address")
-
-        save = st.form_submit_button(
-            "Save Vendor",
-            use_container_width=True
-        )
-
+        c1,c2=st.columns(2); name=c1.text_input("Vendor Name *"); contact=c1.text_input("Mobile"); email=c2.text_input("Email"); gst=c2.text_input("GST"); address=st.text_area("Address")
+        save=st.form_submit_button("➕ Save Vendor",use_container_width=True)
         if save:
-
-            if not name:
-                st.error("Vendor name required.")
-            else:
-
-                execute("""
-                    INSERT INTO vendors
-                    (name,contact,email,gst,address,created_at)
-                    VALUES(?,?,?,?,?,?)
-                """, (
-                    name,contact,email,gst,address,now()
-                ))
-
-                st.success("Vendor added.")
-                st.rerun()
-
-    st.divider()
-
-    st.dataframe(
-        query("""
-            SELECT *
-            FROM vendors
-            ORDER BY id DESC
-        """),
-        use_container_width=True
-    )
+            if not name.strip(): st.error("Vendor name required.")
+            else: execute("INSERT INTO vendors (name,contact,email,gst,address,created_at) VALUES(?,?,?,?,?,?)",(name.strip(),contact,email,gst,address,now())); st.success("Vendor added."); st.rerun()
+    st.divider(); st.subheader("✏️ Edit Vendor")
+    vendor_df=query("SELECT * FROM vendors ORDER BY name")
+    if len(vendor_df):
+        vmap={f"{r['name']} | {r['contact'] or '-'}":int(r['id']) for _,r in vendor_df.iterrows()}; sel=st.selectbox("Select Vendor",list(vmap.keys()),key="edit_vendor_select"); vid=vmap[sel]; r=vendor_df[vendor_df.id==vid].iloc[0]
+        with st.form("edit_vendor"):
+            c1,c2=st.columns(2); ename=c1.text_input("Name",r["name"] or ""); econtact=c1.text_input("Mobile",r["contact"] or ""); eemail=c2.text_input("Email",r["email"] or ""); egst=c2.text_input("GST",r["gst"] or ""); eaddress=st.text_area("Address",r["address"] or "")
+            b1,b2=st.columns(2); update=b1.form_submit_button("💾 Update Vendor",use_container_width=True); delete=b2.form_submit_button("🗑️ Delete Vendor",use_container_width=True)
+            if update: execute("UPDATE vendors SET name=?,contact=?,email=?,gst=?,address=? WHERE id=?",(ename,econtact,eemail,egst,eaddress,vid)); st.success("Vendor updated."); st.rerun()
+            if delete: execute("DELETE FROM vendors WHERE id=?",(vid,)); st.success("Vendor deleted."); st.rerun()
+    st.dataframe(query("SELECT * FROM vendors ORDER BY id DESC"),use_container_width=True)
 
 
 # ============================================================
@@ -1215,149 +1339,31 @@ elif menu == "Vendor Registration":
 elif menu == "Engineer / Technician":
 
     st.title("👷 Engineer / Technician Management")
-
     with st.form("engineer"):
-
-        c1,c2,c3 = st.columns(3)
-
-        name = c1.text_input("Engineer Name *")
-        mobile = c2.text_input("Mobile")
-        email = c3.text_input("Email")
-
-        c1,c2,c3 = st.columns(3)
-
-        designation = c1.text_input(
-            "Designation",
-            "Service Engineer"
-        )
-
-        salary_type = c2.selectbox(
-            "Salary Type",
-            [
-                "Monthly",
-                "Daily"
-            ]
-        )
-
-        salary = c3.number_input(
-            "Monthly Salary",
-            min_value=0.0,
-            step=500.0
-        )
-
-        daily_rate = st.number_input(
-            "Daily Rate",
-            min_value=0.0,
-            step=100.0,
-            help="Used when Salary Type is Daily."
-        )
-
-        c1,c2,c3 = st.columns(3)
-
-        working_days = c1.number_input(
-            "Salary Working Days / Month",
-            min_value=1.0,
-            max_value=31.0,
-            value=26.0,
-            step=1.0,
-            help="For monthly salary calculation. Example: 26 working days."
-        )
-
-        standard_hours = c2.number_input(
-            "Standard Hours / Day",
-            min_value=1.0,
-            max_value=24.0,
-            value=8.0,
-            step=0.5
-        )
-
-        ot_rate = c3.number_input(
-            "OT Rate / Hour",
-            min_value=0.0,
-            value=0.0,
-            step=10.0,
-            help="Keep 0 for automatic 1.5x hourly rate."
-        )
-
-        ot_multiplier = st.number_input(
-            "Automatic OT Multiplier",
-            min_value=1.0,
-            max_value=5.0,
-            value=1.5,
-            step=0.5,
-            help="Used only when OT Rate / Hour is 0."
-        )
-
-        joining_date = st.date_input(
-            "Joining Date",
-            date.today()
-        )
-
-        address = st.text_area("Address")
-
-        save = st.form_submit_button(
-            "➕ Add Engineer",
-            use_container_width=True
-        )
-
+        c1,c2,c3=st.columns(3); name=c1.text_input("Engineer Name *"); mobile=c2.text_input("Mobile"); email=c3.text_input("Email")
+        c1,c2,c3=st.columns(3); designation=c1.text_input("Designation","Service Engineer"); salary_type=c2.selectbox("Salary Type",["Monthly","Daily"]); salary=c3.number_input("Monthly Salary",min_value=0.0,step=500.0)
+        daily_rate=st.number_input("Daily Rate",min_value=0.0,step=100.0)
+        c1,c2,c3=st.columns(3); working_days=c1.number_input("Salary Working Days / Month",1.0,31.0,26.0,1.0); standard_hours=c2.number_input("Standard Hours / Day",1.0,24.0,8.0,.5); ot_rate=c3.number_input("OT Rate / Hour",0.0,step=10.0)
+        ot_multiplier=st.number_input("Automatic OT Multiplier",1.0,5.0,1.5,.5); joining_date=st.date_input("Joining Date",date.today()); address=st.text_area("Address")
+        save=st.form_submit_button("➕ Add Engineer",use_container_width=True)
         if save:
-
-            if not name:
-                st.error("Engineer name required.")
+            if not name.strip(): st.error("Engineer name required.")
             else:
-
-                execute("""
-                    INSERT INTO engineers
-                    (name,mobile,email,designation,
-                     salary_type,salary,daily_rate,
-                     working_days,standard_hours,ot_rate,ot_multiplier,
-                     joining_date,address,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    name,
-                    mobile,
-                    email,
-                    designation,
-                    salary_type,
-                    salary,
-                    daily_rate,
-                    working_days,
-                    standard_hours,
-                    ot_rate,
-                    ot_multiplier,
-                    str(joining_date),
-                    address,
-                    now()
-                ))
-
-                st.success("Engineer added.")
-                st.rerun()
-
-    st.divider()
-
-    df = query("""
-        SELECT
-            id,
-            name,
-            mobile,
-            designation,
-            salary_type,
-            salary,
-            daily_rate,
-            working_days,
-            standard_hours,
-            ot_rate,
-            ot_multiplier,
-            joining_date,
-            CASE
-                WHEN active=1 THEN 'Active'
-                ELSE 'Inactive'
-            END status
-        FROM engineers
-        ORDER BY id DESC
-    """)
-
-    st.dataframe(df, use_container_width=True)
+                execute("""INSERT INTO engineers (name,mobile,email,designation,salary_type,salary,daily_rate,working_days,standard_hours,ot_rate,ot_multiplier,joining_date,address,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(name,mobile,email,designation,salary_type,salary,daily_rate,working_days,standard_hours,ot_rate,ot_multiplier,str(joining_date),address,now())); st.success("Engineer added."); st.rerun()
+    st.divider(); st.subheader("✏️ Edit / Update Technician")
+    edf=query("SELECT * FROM engineers ORDER BY name")
+    if len(edf):
+        emap={f"{r['name']} | {r['mobile'] or '-'}":int(r['id']) for _,r in edf.iterrows()}; sel=st.selectbox("Select Technician",list(emap.keys()),key="edit_engineer_select"); eid=emap[sel]; r=edf[edf.id==eid].iloc[0]
+        with st.form("edit_engineer"):
+            c1,c2,c3=st.columns(3); ename=c1.text_input("Name",r["name"] or ""); emobile=c2.text_input("Mobile",r["mobile"] or ""); eemail=c3.text_input("Email",r["email"] or "")
+            c1,c2,c3=st.columns(3); edes=c1.text_input("Designation",r["designation"] or ""); estype=c2.selectbox("Salary Type",["Monthly","Daily"],index=0 if (r["salary_type"] or "Monthly")=="Monthly" else 1); esalary=c3.number_input("Monthly Salary",min_value=0.0,value=float(r["salary"] or 0),step=500.0)
+            c1,c2,c3=st.columns(3); edaily=c1.number_input("Daily Rate",min_value=0.0,value=float(r["daily_rate"] or 0),step=100.0); ewd=c2.number_input("Working Days / Month",1.0,31.0,float(r["working_days"] or 26),1.0); esh=c3.number_input("Standard Hours / Day",1.0,24.0,float(r["standard_hours"] or 8),.5)
+            c1,c2,c3=st.columns(3); eot=c1.number_input("OT Rate / Hour",min_value=0.0,value=float(r["ot_rate"] or 0),step=10.0); eom=c2.number_input("OT Multiplier",1.0,5.0,float(r["ot_multiplier"] or 1.5),.5); ejoin=c3.date_input("Joining Date",datetime.strptime(r["joining_date"],"%Y-%m-%d").date() if r["joining_date"] else date.today())
+            eaddress=st.text_area("Address",r["address"] or ""); active=st.checkbox("Active",value=bool(r["active"])); b1,b2=st.columns(2); update=b1.form_submit_button("💾 Update Technician",use_container_width=True); delete=b2.form_submit_button("🗑️ Delete Technician",use_container_width=True)
+            if update:
+                execute("""UPDATE engineers SET name=?,mobile=?,email=?,designation=?,salary_type=?,salary=?,daily_rate=?,working_days=?,standard_hours=?,ot_rate=?,ot_multiplier=?,joining_date=?,address=?,active=? WHERE id=?""",(ename,emobile,eemail,edes,estype,esalary,edaily,ewd,esh,eot,eom,str(ejoin),eaddress,int(active),eid)); st.success("Technician details updated."); st.rerun()
+            if delete: execute("UPDATE engineers SET active=0 WHERE id=?",(eid,)); st.success("Technician deactivated."); st.rerun()
+    st.dataframe(query("SELECT id,name,mobile,designation,salary_type,salary,daily_rate,working_days,standard_hours,ot_rate,ot_multiplier,joining_date,CASE WHEN active=1 THEN 'Active' ELSE 'Inactive' END status FROM engineers ORDER BY id DESC"),use_container_width=True)
 
 
 # ============================================================
@@ -1365,169 +1371,33 @@ elif menu == "Engineer / Technician":
 # ============================================================
 
 elif menu == "Service Calls":
-
     st.title("🛠️ Service Call Management")
-
-    clients = query(
-        "SELECT id,name FROM clients ORDER BY name"
-    )
-
-    engineers = query("""
-        SELECT id,name
-        FROM engineers
-        WHERE active=1
-        ORDER BY name
-    """)
-
-    if len(clients) == 0:
-        st.warning("First register client.")
-    elif len(engineers) == 0:
-        st.warning("First register engineer.")
+    clients=query("SELECT id,name FROM clients ORDER BY name"); engineers=query("SELECT id,name FROM engineers WHERE active=1 ORDER BY name")
+    if not len(clients): st.warning("First register client.")
+    elif not len(engineers): st.warning("First register engineer.")
     else:
-
-        client_map = dict(
-            zip(clients["name"],clients["id"])
-        )
-
-        engineer_map = dict(
-            zip(engineers["name"],engineers["id"])
-        )
-
+        cmap=dict(zip(clients.name,clients.id)); emap=dict(zip(engineers.name,engineers.id))
         with st.form("service_call"):
-
-            call_no = st.text_input(
-                "Call No.",
-                f"CALL-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-            )
-
-            c1,c2 = st.columns(2)
-
-            client_name = c1.selectbox(
-                "Client",
-                list(client_map.keys())
-            )
-
-            engineer_name = c2.selectbox(
-                "Assign Engineer",
-                list(engineer_map.keys())
-            )
-
-            c1,c2,c3 = st.columns(3)
-
-            site = c1.text_input("Site / Location")
-
-            priority = c2.selectbox(
-                "Priority",
-                ["Low","Medium","High","Emergency"]
-            )
-
-            status = c3.selectbox(
-                "Status",
-                [
-                    "Open",
-                    "Assigned",
-                    "In Progress",
-                    "Completed",
-                    "Cancelled"
-                ]
-            )
-
-            complaint = st.text_area(
-                "Complaint / Service Requirement"
-            )
-
-            c1,c2 = st.columns(2)
-
-            call_date = c1.date_input(
-                "Call Date",
-                date.today()
-            )
-
-            scheduled_date = c2.date_input(
-                "Visit / Schedule Date",
-                date.today()
-            )
-
-            material = st.text_input(
-                "Material Used"
-            )
-
-            remarks = st.text_area(
-                "Remarks"
-            )
-
-            save = st.form_submit_button(
-                "📌 Assign & Save Call",
-                use_container_width=True
-            )
-
+            call_no=st.text_input("Call No.",f"CALL-{datetime.now().strftime('%Y%m%d%H%M%S')}"); c1,c2=st.columns(2); client_name=c1.selectbox("Client",list(cmap)); engineer_name=c2.selectbox("Assign Engineer",list(emap))
+            c1,c2,c3=st.columns(3); site=c1.text_input("Site / Location"); priority=c2.selectbox("Priority",["Low","Medium","High","Emergency"]); status=c3.selectbox("Status",["Open","Assigned","Pending Process","In Progress","Completed","Cancelled"])
+            complaint=st.text_area("Complaint / Service Requirement"); c1,c2=st.columns(2); call_date=c1.date_input("Call Date",date.today()); scheduled_date=c2.date_input("Visit / Schedule Date",date.today()); material=st.text_input("Material Used"); remarks=st.text_area("Remarks")
+            save=st.form_submit_button("📌 Assign & Save Call",use_container_width=True)
             if save:
-
-                execute("""
-                    INSERT INTO service_calls
-                    (call_no,client_id,site,complaint,
-                     priority,engineer_id,call_date,
-                     scheduled_date,status,material,
-                     remarks,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    call_no,
-                    client_map[client_name],
-                    site,
-                    complaint,
-                    priority,
-                    engineer_map[engineer_name],
-                    str(call_date),
-                    str(scheduled_date),
-                    status,
-                    material,
-                    remarks,
-                    now()
-                ))
-
-                st.success(
-                    f"Call assigned to {engineer_name}"
-                )
-
-                st.rerun()
-
-    st.divider()
-
-    df = query("""
-        SELECT
-            s.id,
-            s.call_no,
-            c.name client,
-            s.site,
-            s.complaint,
-            s.priority,
-            e.name engineer,
-            s.call_date,
-            s.scheduled_date,
-            s.status
-        FROM service_calls s
-        LEFT JOIN clients c
-            ON s.client_id=c.id
-        LEFT JOIN engineers e
-            ON s.engineer_id=e.id
-        ORDER BY s.id DESC
-    """)
-
-    st.dataframe(df, use_container_width=True)
-
-    if len(df):
-        st.subheader("🖨️ Printable Service Report PDF")
-        service_options = [f"{r.call_no} | {r.client} | {r.call_date}" for _, r in df.iterrows()]
-        service_selected = st.selectbox("Select service call to print", service_options, key="print_service_report")
-        service_row = df.iloc[service_options.index(service_selected)]
-        st.download_button(
-            "🖨️ Download / Print Service Report PDF",
-            service_call_pdf(service_row),
-            f"service_report_{service_row['call_no']}.pdf",
-            "application/pdf",
-            use_container_width=True,
-            key="download_service_report_pdf"
-        )
+                execute("""INSERT INTO service_calls (call_no,client_id,site,complaint,priority,engineer_id,call_date,scheduled_date,status,material,remarks,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",(call_no,cmap[client_name],site,complaint,priority,emap[engineer_name],str(call_date),str(scheduled_date),status,material,remarks,now())); st.success(f"Call assigned to {engineer_name}"); st.rerun()
+    st.divider(); st.subheader("✏️ Update Service Call")
+    sdf=query("SELECT s.*,c.name client,e.name engineer FROM service_calls s LEFT JOIN clients c ON c.id=s.client_id LEFT JOIN engineers e ON e.id=s.engineer_id ORDER BY s.id DESC")
+    if len(sdf):
+        smap={f"{r['call_no']} | {r['client']} | {r['status']}":int(r['id']) for _,r in sdf.iterrows()}; ss=st.selectbox("Select Call",list(smap),key="edit_service_select"); sid=smap[ss]; r=sdf[sdf.id==sid].iloc[0]
+        clients_all=query("SELECT id,name FROM clients ORDER BY name"); eng_all=query("SELECT id,name FROM engineers ORDER BY name"); cmap2=dict(zip(clients_all.name,clients_all.id)); emap2=dict(zip(eng_all.name,eng_all.id))
+        with st.form("edit_service"):
+            c1,c2,c3=st.columns(3); eclient=c1.selectbox("Client",list(cmap2),index=list(cmap2.values()).index(int(r["client_id"])) if int(r["client_id"] or 0) in list(cmap2.values()) else 0); eeng=c2.selectbox("Technician",list(emap2),index=list(emap2.values()).index(int(r["engineer_id"])) if r["engineer_id"] and int(r["engineer_id"]) in list(emap2.values()) else 0); estat=c3.selectbox("Status",["Open","Assigned","Pending Process","In Progress","Completed","Cancelled"],index=["Open","Assigned","Pending Process","In Progress","Completed","Cancelled"].index(r["status"]) if r["status"] in ["Open","Assigned","Pending Process","In Progress","Completed","Cancelled"] else 0)
+            esite=st.text_input("Site / Location",r["site"] or ""); epriority=st.selectbox("Priority",["Low","Medium","High","Emergency"],index=["Low","Medium","High","Emergency"].index(r["priority"]) if r["priority"] in ["Low","Medium","High","Emergency"] else 0); ecomplaint=st.text_area("Complaint",r["complaint"] or ""); ematerial=st.text_input("Material Used",r["material"] or ""); eremarks=st.text_area("Remarks",r["remarks"] or ""); ecust=st.text_area("Customer Feedback",r["customer_feedback"] or "")
+            update=st.form_submit_button("💾 UPDATE / CLOSE CALL",type="primary",use_container_width=True)
+            if update:
+                execute("""UPDATE service_calls SET client_id=?,site=?,complaint=?,priority=?,engineer_id=?,status=?,material=?,remarks=?,customer_feedback=? WHERE id=?""",(cmap2[eclient],esite,ecomplaint,epriority,emap2[eeng],estat,ematerial,eremarks,ecust,sid)); st.success(f"Service Call {r['call_no']} updated to {estat}."); st.rerun()
+    st.dataframe(sdf[["id","call_no","client","site","priority","engineer","scheduled_date","status"]] if len(sdf) else sdf,use_container_width=True)
+    if len(sdf):
+        st.subheader("🖨️ Printable Service Report PDF"); opts=[f"{r.call_no} | {r.client} | {r.call_date}" for _,r in sdf.iterrows()]; sel=st.selectbox("Select service call to print",opts,key="print_service_report"); row=sdf.iloc[opts.index(sel)]; st.download_button("🖨️ Download / Print Service Report PDF",service_call_pdf(row),f"service_report_{row['call_no']}.pdf","application/pdf",use_container_width=True,key="download_service_report_pdf")
 
 
 # ============================================================
@@ -2044,12 +1914,28 @@ elif menu == "Inventory":
                     st.rerun()
 
     st.divider()
+    st.subheader("✏️ Edit / Update Inventory Item")
+    inv_edit=query("SELECT * FROM inventory ORDER BY item_name")
+    if len(inv_edit):
+        imap={f"{r['item_name']} | {r['item_code'] or '-'}":int(r['id']) for _,r in inv_edit.iterrows()}
+        isel=st.selectbox("Select Item",list(imap),key="edit_inventory_select"); iid=imap[isel]; r=inv_edit[inv_edit.id==iid].iloc[0]
+        with st.form("edit_inventory"):
+            c1,c2,c3=st.columns(3); icode=c1.text_input("Item Code",r["item_code"] or ""); iname=c2.text_input("Item Name",r["item_name"] or ""); icat=c3.text_input("Category",r["category"] or "")
+            c1,c2,c3,c4=st.columns(4); iunit=c1.text_input("Unit",r["unit"] or "Nos"); iqty=c2.number_input("Current Stock",min_value=0.0,value=float(r["quantity"] or 0),step=1.0); imin=c3.number_input("Minimum Stock",min_value=0.0,value=float(r["min_stock"] or 0),step=1.0); ipurchase=c4.number_input("Purchase Rate",min_value=0.0,value=float(r["purchase_rate"] or 0),step=10.0)
+            iselling=st.number_input("Selling Rate",min_value=0.0,value=float(r["selling_rate"] or 0),step=10.0); b1,b2=st.columns(2); update=b1.form_submit_button("💾 Update Item",use_container_width=True); delete=b2.form_submit_button("🗑️ Delete Item",use_container_width=True)
+            if update:
+                execute("UPDATE inventory SET item_code=?,item_name=?,category=?,unit=?,quantity=?,min_stock=?,purchase_rate=?,selling_rate=? WHERE id=?",(icode,iname,icat,iunit,iqty,imin,ipurchase,iselling,iid)); st.success("Inventory item updated."); st.rerun()
+            if delete:
+                execute("DELETE FROM inventory WHERE id=?",(iid,)); st.success("Inventory item deleted."); st.rerun()
+
+    st.divider()
 
     st.dataframe(
         query("""
             SELECT
                 item_code,
                 item_name,
+                category,
                 category,
                 unit,
                 quantity,
@@ -2073,140 +1959,20 @@ elif menu == "Inventory":
 # ============================================================
 
 elif menu == "Quotation":
-
     st.title("🧾 Quotation")
-
-    clients = query(
-        "SELECT id,name FROM clients ORDER BY name"
-    )
-
+    clients=query("SELECT id,name FROM clients ORDER BY name")
     if len(clients):
-
-        client_map = dict(
-            zip(clients["name"],clients["id"])
-        )
-
+        cmap=dict(zip(clients.name,clients.id))
         with st.form("quotation"):
-
-            quotation_no = st.text_input(
-                "Quotation No.",
-                f"QT-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-            )
-
-            client = st.selectbox(
-                "Client",
-                list(client_map.keys())
-            )
-
-            quotation_date = st.date_input(
-                "Date",
-                date.today()
-            )
-
-            c1,c2,c3 = st.columns(3)
-
-            subtotal = c1.number_input(
-                "Subtotal",
-                min_value=0.0
-            )
-
-            discount = c2.number_input(
-                "Discount",
-                min_value=0.0
-            )
-
-            gst_rate = c3.number_input(
-                "GST %",
-                value=18.0
-            )
-
-            taxable = max(
-                subtotal-discount,
-                0
-            )
-
-            gst = taxable*gst_rate/100
-            total = taxable+gst
-
-            st.success(
-                f"Taxable: {money(taxable)} | "
-                f"GST: {money(gst)} | "
-                f"Total: {money(total)}"
-            )
-
-            status = st.selectbox(
-                "Status",
-                [
-                    "Draft",
-                    "Pending",
-                    "Approved",
-                    "Rejected",
-                    "Converted"
-                ]
-            )
-
-            terms = st.text_area(
-                "Quotation T&C",
-                settings["quotation_terms"]
-            )
-
-            save = st.form_submit_button(
-                "Save Quotation",
-                use_container_width=True
-            )
-
+            qno=st.text_input("Quotation No.",f"QT-{datetime.now().strftime('%Y%m%d%H%M%S')}"); client=st.selectbox("Client",list(cmap)); qdate=st.date_input("Date",date.today())
+            st.subheader("📦 Products / Services"); edited=product_editor("quotation",True); items=normalize_items_dataframe(edited); subtotal,gst_from_items=line_items_totals(items)
+            c1,c2,c3=st.columns(3); discount=c1.number_input("Discount",0.0); gst_rate=c2.number_input("Default GST %",18.0); status=c3.selectbox("Status",["Draft","Pending","Approved","Rejected","Converted"]); gst_base=max(subtotal-discount,0); gst=(gst_from_items * (gst_base/max(subtotal,1))) if items and subtotal>0 else gst_base*gst_rate/100; total=gst_base+gst
+            st.success(f"Subtotal: {money(subtotal)} | GST: {money(gst)} | Total: {money(total)}"); terms=st.text_area("Quotation T&C",settings["quotation_terms"] or ""); save=st.form_submit_button("💾 SAVE QUOTATION",type="primary",use_container_width=True)
             if save:
-
-                execute("""
-                    INSERT INTO quotations
-                    (quotation_no,client_id,quotation_date,
-                     subtotal,gst,discount,total,status,
-                     remarks,terms,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    quotation_no,
-                    client_map[client],
-                    str(quotation_date),
-                    subtotal,
-                    gst,
-                    discount,
-                    total,
-                    status,
-                    "",
-                    terms,
-                    now()
-                ))
-
-                st.success("Quotation saved.")
-                st.rerun()
-
-    st.divider()
-
-    quotation_list = query("""
-        SELECT q.*, c.name client
-        FROM quotations q
-        LEFT JOIN clients c ON q.client_id=c.id
-        ORDER BY q.id DESC
-    """)
-
-    st.dataframe(quotation_list[[
-        "quotation_no", "client", "quotation_date", "subtotal",
-        "discount", "gst", "total", "status"
-    ]] if len(quotation_list) else quotation_list, use_container_width=True)
-
-    if len(quotation_list):
-        st.subheader("🖨️ Printable Quotation PDF")
-        q_options = [f"{r.quotation_no} | {r.client} | {r.quotation_date}" for _, r in quotation_list.iterrows()]
-        q_selected = st.selectbox("Select quotation to print", q_options, key="print_quotation")
-        q_row = quotation_list.iloc[q_options.index(q_selected)]
-        st.download_button(
-            "🖨️ Download / Print Quotation PDF",
-            quotation_pdf(q_row),
-            f"quotation_{q_row['quotation_no']}.pdf",
-            "application/pdf",
-            use_container_width=True,
-            key="download_quotation_pdf"
-        )
+                qid=execute("""INSERT INTO quotations (quotation_no,client_id,quotation_date,subtotal,gst,discount,total,status,remarks,terms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",(qno,cmap[client],str(qdate),subtotal,gst,discount,total,status,"",terms,now())); save_document_items("quotation",qid,items); st.success("Quotation saved with products/services."); st.rerun()
+    st.divider(); ql=query("SELECT q.*,c.name client FROM quotations q LEFT JOIN clients c ON q.client_id=c.id ORDER BY q.id DESC"); st.dataframe(ql[["id","quotation_no","client","quotation_date","subtotal","discount","gst","total","status"]] if len(ql) else ql,use_container_width=True)
+    if len(ql):
+        opts=[f"{r.quotation_no} | {r.client} | {r.quotation_date}" for _,r in ql.iterrows()]; sel=st.selectbox("Select quotation to print",opts,key="print_quotation"); row=ql.iloc[opts.index(sel)]; st.download_button("🖨️ Download / Print Quotation PDF",quotation_pdf(row),f"quotation_{row['quotation_no']}.pdf","application/pdf",use_container_width=True,key="download_quotation_pdf")
 
 
 # ============================================================
@@ -2214,116 +1980,18 @@ elif menu == "Quotation":
 # ============================================================
 
 elif menu == "Challan":
-
     st.title("🚚 Delivery Challan")
-
-    clients = query(
-        "SELECT id,name FROM clients ORDER BY name"
-    )
-
+    clients=query("SELECT id,name FROM clients ORDER BY name")
     if len(clients):
-
-        client_map = dict(
-            zip(clients["name"],clients["id"])
-        )
-
+        cmap=dict(zip(clients.name,clients.id))
         with st.form("challan"):
-
-            challan_no = st.text_input(
-                "Challan No.",
-                f"DC-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-            )
-
-            client = st.selectbox(
-                "Client",
-                list(client_map.keys())
-            )
-
-            challan_date = st.date_input(
-                "Date",
-                date.today()
-            )
-
-            item = st.text_input(
-                "Material / Item"
-            )
-
-            qty = st.number_input(
-                "Quantity",
-                min_value=0.0
-            )
-
-            returnable = st.selectbox(
-                "Returnable",
-                ["No","Yes"]
-            )
-
-            status = st.selectbox(
-                "Status",
-                [
-                    "Delivered",
-                    "Pending Return",
-                    "Returned"
-                ]
-            )
-
-            remarks = st.text_area("Remarks")
-
-            save = st.form_submit_button(
-                "Create Challan",
-                use_container_width=True
-            )
-
+            cno=st.text_input("Challan No.",f"DC-{datetime.now().strftime('%Y%m%d%H%M%S')}"); client=st.selectbox("Client",list(cmap)); cdate=st.date_input("Date",date.today()); returnable=st.selectbox("Returnable",["No","Yes"]); status=st.selectbox("Status",["Delivered","Pending Return","Returned"]); st.subheader("📦 Materials / Products"); edited=product_editor("challan",False); items=normalize_items_dataframe(edited, get_inventory_products()); remarks=st.text_area("Remarks"); save=st.form_submit_button("🚚 CREATE CHALLAN",type="primary",use_container_width=True)
             if save:
-
-                execute("""
-                    INSERT INTO challans
-                    (challan_no,client_id,challan_date,
-                     item,quantity,returnable,status,
-                     remarks,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?)
-                """, (
-                    challan_no,
-                    client_map[client],
-                    str(challan_date),
-                    item,
-                    qty,
-                    returnable,
-                    status,
-                    remarks,
-                    now()
-                ))
-
-                st.success("Challan created.")
-                st.rerun()
-
-    st.divider()
-
-    challan_list = query("""
-        SELECT ch.*, c.name client
-        FROM challans ch
-        LEFT JOIN clients c ON ch.client_id=c.id
-        ORDER BY ch.id DESC
-    """)
-
-    st.dataframe(challan_list[[
-        "challan_no", "client", "challan_date", "item",
-        "quantity", "returnable", "status"
-    ]] if len(challan_list) else challan_list, use_container_width=True)
-
-    if len(challan_list):
-        st.subheader("🖨️ Printable Delivery Challan PDF")
-        ch_options = [f"{r.challan_no} | {r.client} | {r.challan_date}" for _, r in challan_list.iterrows()]
-        ch_selected = st.selectbox("Select challan to print", ch_options, key="print_challan")
-        ch_row = challan_list.iloc[ch_options.index(ch_selected)]
-        st.download_button(
-            "🖨️ Download / Print Challan PDF",
-            challan_pdf(ch_row),
-            f"challan_{ch_row['challan_no']}.pdf",
-            "application/pdf",
-            use_container_width=True,
-            key="download_challan_pdf"
-        )
+                first=items[0] if items else {"item_name":"","quantity":0}
+                cid=execute("""INSERT INTO challans (challan_no,client_id,challan_date,item,quantity,returnable,status,remarks,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",(cno,cmap[client],str(cdate),first.get("item_name",""),first.get("quantity",0),returnable,status,remarks,now())); save_document_items("challan",cid,items); st.success("Challan created with materials."); st.rerun()
+    st.divider(); cl=query("SELECT ch.*,c.name client FROM challans ch LEFT JOIN clients c ON ch.client_id=c.id ORDER BY ch.id DESC"); st.dataframe(cl[["id","challan_no","client","challan_date","item","quantity","returnable","status"]] if len(cl) else cl,use_container_width=True)
+    if len(cl):
+        opts=[f"{r.challan_no} | {r.client} | {r.challan_date}" for _,r in cl.iterrows()]; sel=st.selectbox("Select challan to print",opts,key="print_challan"); row=cl.iloc[opts.index(sel)]; st.download_button("🖨️ Download / Print Challan PDF",challan_pdf(row),f"challan_{row['challan_no']}.pdf","application/pdf",use_container_width=True,key="download_challan_pdf")
 
 
 # ============================================================
@@ -2331,162 +1999,141 @@ elif menu == "Challan":
 # ============================================================
 
 elif menu == "Bill / Invoice":
-
     st.title("💰 Bill / Invoice")
-
-    clients = query(
-        "SELECT id,name FROM clients ORDER BY name"
-    )
-
+    clients=query("SELECT id,name FROM clients ORDER BY name")
     if len(clients):
-
-        client_map = dict(
-            zip(clients["name"],clients["id"])
-        )
-
+        cmap=dict(zip(clients.name,clients.id))
         with st.form("invoice"):
-
-            invoice_no = st.text_input(
-                "Invoice No.",
-                f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-            )
-
-            client = st.selectbox(
-                "Client",
-                list(client_map.keys())
-            )
-
-            invoice_date = st.date_input(
-                "Invoice Date",
-                date.today()
-            )
-
-            c1,c2,c3 = st.columns(3)
-
-            subtotal = c1.number_input(
-                "Subtotal",
-                min_value=0.0
-            )
-
-            discount = c2.number_input(
-                "Discount",
-                min_value=0.0
-            )
-
-            gst_rate = c3.number_input(
-                "GST %",
-                value=18.0
-            )
-
-            paid = st.number_input(
-                "Amount Received",
-                min_value=0.0
-            )
-
-            taxable = max(
-                subtotal-discount,
-                0
-            )
-
-            gst = taxable*gst_rate/100
-            total = taxable+gst
-            balance = max(total-paid,0)
-
-            if balance == 0:
-                status = "Paid"
-            elif paid > 0:
-                status = "Partially Paid"
-            else:
-                status = "Unpaid"
-
-            st.info(
-                f"Total: {money(total)} | "
-                f"Paid: {money(paid)} | "
-                f"Balance: {money(balance)}"
-            )
-
-            terms = st.text_area(
-                "Invoice T&C",
-                settings["invoice_terms"]
-            )
-
-            save = st.form_submit_button(
-                "Save Invoice",
-                use_container_width=True
-            )
-
+            ino=st.text_input("Invoice No.",f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}"); client=st.selectbox("Client",list(cmap)); idate=st.date_input("Invoice Date",date.today()); st.subheader("📦 Products / Services"); edited=product_editor("invoice",True); items=normalize_items_dataframe(edited); subtotal,gst_from_items=line_items_totals(items)
+            c1,c2=st.columns(2); discount=c1.number_input("Discount",0.0); paid=c2.number_input("Amount Received",0.0); gst_base=max(subtotal-discount,0); gst=(gst_from_items * (gst_base/max(subtotal,1))) if items and subtotal>0 else 0; total=gst_base+gst; balance=max(total-paid,0); status="Paid" if balance==0 else ("Partially Paid" if paid>0 else "Unpaid")
+            st.info(f"Subtotal: {money(subtotal)} | GST: {money(gst)} | Total: {money(total)} | Paid: {money(paid)} | Balance: {money(balance)}"); terms=st.text_area("Invoice T&C",settings["invoice_terms"] or ""); save=st.form_submit_button("💾 SAVE BILL / INVOICE",type="primary",use_container_width=True)
             if save:
+                iid=execute("""INSERT INTO invoices (invoice_no,client_id,invoice_date,subtotal,gst,discount,total,paid,balance,status,remarks,terms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",(ino,cmap[client],str(idate),subtotal,gst,discount,total,paid,balance,status,"",terms,now())); save_document_items("invoice",iid,items)
+                if paid>0: execute("INSERT INTO payments (client_id,invoice_no,payment_date,amount,mode,remarks,created_at) VALUES(?,?,?,?,?,?,?)",(cmap[client],ino,str(idate),paid,"Cash/Bank/UPI","Initial Payment",now()))
+                st.success("Invoice saved with products/services."); st.rerun()
+    st.divider(); il=query("SELECT i.*,c.name client FROM invoices i LEFT JOIN clients c ON i.client_id=c.id ORDER BY i.id DESC"); st.dataframe(il[["id","invoice_no","client","invoice_date","subtotal","gst","discount","total","paid","balance","status"]] if len(il) else il,use_container_width=True)
+    if len(il):
+        opts=[f"{r.invoice_no} | {r.client} | {r.invoice_date}" for _,r in il.iterrows()]; sel=st.selectbox("Select invoice to print",opts,key="print_invoice"); row=il.iloc[opts.index(sel)]; st.download_button("🖨️ Download / Print Bill PDF",invoice_pdf(row),f"invoice_{row['invoice_no']}.pdf","application/pdf",use_container_width=True,key="download_invoice_pdf")
 
-                execute("""
-                    INSERT INTO invoices
-                    (invoice_no,client_id,invoice_date,
-                     subtotal,gst,discount,total,
-                     paid,balance,status,
-                     remarks,terms,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    invoice_no,
-                    client_map[client],
-                    str(invoice_date),
-                    subtotal,
-                    gst,
-                    discount,
-                    total,
-                    paid,
-                    balance,
-                    status,
-                    "",
-                    terms,
-                    now()
-                ))
 
-                if paid > 0:
+# ============================================================
+# PAYMENT COLLECTION
+# ============================================================
 
-                    execute("""
-                        INSERT INTO payments
-                        (client_id,invoice_no,payment_date,
-                         amount,mode,remarks,created_at)
-                        VALUES(?,?,?,?,?,?,?)
-                    """, (
-                        client_map[client],
-                        invoice_no,
-                        str(invoice_date),
-                        paid,
-                        "Cash/Bank/UPI",
-                        "Initial Payment",
-                        now()
-                    ))
-
-                st.success("Invoice saved.")
+elif menu == "Payment Collection":
+    st.title("💳 Daily Payment Collection")
+    st.caption("Cash / Bank / UPI / Cheque collection ki daily entry karein. Month-wise report automatically banegi.")
+    clients = query("SELECT id,name FROM clients ORDER BY name")
+    cmap = dict(zip(clients.name, clients.id)) if len(clients) else {}
+    with st.form("daily_collection"):
+        c1,c2,c3 = st.columns(3)
+        payment_date = c1.date_input("Collection Date", date.today())
+        mode = c2.selectbox("Payment Mode", ["Cash","Bank Received","UPI","Cheque","Card","Other"])
+        amount = c3.number_input("Amount Received", min_value=0.0, step=100.0)
+        c1,c2 = st.columns(2)
+        client_name = c1.selectbox("Client (optional)", ["-- General Receipt --"] + list(cmap.keys()))
+        invoice_no = c2.text_input("Invoice No. (optional)")
+        reference = st.text_input("Reference / UTR / Cheque No.")
+        remarks = st.text_area("Remarks")
+        save = st.form_submit_button("💾 SAVE COLLECTION", type="primary", use_container_width=True)
+        if save:
+            if amount <= 0:
+                st.error("Amount must be greater than zero.")
+            else:
+                client_id = cmap.get(client_name) if client_name != "-- General Receipt --" else None
+                execute("INSERT INTO payments (client_id,invoice_no,payment_date,amount,mode,remarks,created_at) VALUES(?,?,?,?,?,?,?)", (client_id, invoice_no.strip(), str(payment_date), amount, mode, f"{remarks} | Ref: {reference}".strip(" |"), now()))
+                if invoice_no.strip():
+                    inv = one("SELECT id,total,paid FROM invoices WHERE invoice_no=? ORDER BY id DESC LIMIT 1", (invoice_no.strip(),))
+                    if inv:
+                        new_paid = float(inv["paid"] or 0) + amount
+                        new_balance = max(float(inv["total"] or 0) - new_paid, 0)
+                        new_status = "Paid" if new_balance <= 0 else "Partially Paid"
+                        execute("UPDATE invoices SET paid=?,balance=?,status=? WHERE id=?", (new_paid,new_balance,new_status,inv["id"]))
+                st.success("Payment collection saved.")
                 st.rerun()
-
     st.divider()
+    st.subheader("📋 Daily Collection Register")
+    coll = query("SELECT p.id,p.payment_date,c.name client,p.invoice_no,p.amount,p.mode,p.remarks FROM payments p LEFT JOIN clients c ON p.client_id=c.id ORDER BY p.payment_date DESC,p.id DESC")
+    st.dataframe(coll, use_container_width=True)
+    if len(coll):
+        st.success(f"Total collection: {money(coll['amount'].sum())}")
 
-    invoice_list = query("""
-        SELECT i.*, c.name client
-        FROM invoices i
-        LEFT JOIN clients c ON i.client_id=c.id
-        ORDER BY i.id DESC
-    """)
 
-    st.dataframe(invoice_list[[
-        "invoice_no", "client", "invoice_date", "total",
-        "paid", "balance", "status"
-    ]] if len(invoice_list) else invoice_list, use_container_width=True)
+# ============================================================
+# PURCHASE ENTRY
+# ============================================================
 
-    if len(invoice_list):
-        st.subheader("🖨️ Printable Bill / Invoice PDF")
-        inv_options = [f"{r.invoice_no} | {r.client} | {r.invoice_date}" for _, r in invoice_list.iterrows()]
-        inv_selected = st.selectbox("Select invoice to print", inv_options, key="print_invoice")
-        inv_row = invoice_list.iloc[inv_options.index(inv_selected)]
-        st.download_button(
-            "🖨️ Download / Print Bill PDF",
-            invoice_pdf(inv_row),
-            f"invoice_{inv_row['invoice_no']}.pdf",
-            "application/pdf",
-            use_container_width=True,
-            key="download_invoice_pdf"
-        )
+elif menu == "Purchase Entry":
+    st.title("🛒 Daily Purchase Entry")
+    st.caption("Purchase ki daily entry + stock update. Month-wise purchase report automatically banegi.")
+    vendors = query("SELECT id,name FROM vendors ORDER BY name")
+    vmap = dict(zip(vendors.name, vendors.id)) if len(vendors) else {}
+    products = query("SELECT id,item_name,unit,purchase_rate FROM inventory ORDER BY item_name")
+    if not len(products):
+        st.warning("Pehle Inventory me products add karein.")
+    else:
+        pmap = {r.item_name:int(r.id) for _,r in products.iterrows()}
+        with st.form("purchase_entry"):
+            c1,c2,c3 = st.columns(3)
+            purchase_no = c1.text_input("Purchase No.", f"PUR-{datetime.now().strftime('%Y%m%d%H%M%S')}")
+            purchase_date = c2.date_input("Purchase Date", date.today())
+            vendor_name = c3.selectbox("Vendor", ["-- Direct / Other --"] + list(vmap.keys()))
+            item_name = st.selectbox("Product / Item", list(pmap.keys()))
+            selected = products[products.id==pmap[item_name]].iloc[0]
+            c1,c2,c3,c4 = st.columns(4)
+            qty = c1.number_input("Quantity", min_value=0.01, value=1.0, step=1.0)
+            unit = c2.text_input("Unit", str(selected["unit"] or "Nos"))
+            rate = c3.number_input("Purchase Rate", min_value=0.0, value=float(selected["purchase_rate"] or 0), step=10.0)
+            gst_rate = c4.number_input("GST %", min_value=0.0, value=18.0, step=1.0)
+            payment_mode = st.selectbox("Payment Mode", ["Cash","Bank","UPI","Credit","Cheque","Other"])
+            remarks = st.text_area("Remarks")
+            subtotal = qty * rate; gst_amount = subtotal * gst_rate / 100; total = subtotal + gst_amount
+            st.info(f"Subtotal: {money(subtotal)} | GST: {money(gst_amount)} | Total Purchase: {money(total)}")
+            save = st.form_submit_button("💾 SAVE PURCHASE + UPDATE STOCK", type="primary", use_container_width=True)
+            if save:
+                vendor_id = vmap.get(vendor_name) if vendor_name != "-- Direct / Other --" else None
+                execute("INSERT INTO purchases (purchase_no,vendor_id,purchase_date,item_id,item_name,quantity,unit,rate,gst_rate,gst_amount,subtotal,total,payment_mode,remarks,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (purchase_no,vendor_id,str(purchase_date),pmap[item_name],item_name,qty,unit,rate,gst_rate,gst_amount,subtotal,total,payment_mode,remarks,now()))
+                current = float(one("SELECT quantity FROM inventory WHERE id=?", (pmap[item_name],))["quantity"] or 0)
+                execute("UPDATE inventory SET quantity=?,purchase_rate=? WHERE id=?", (current+qty,rate,pmap[item_name]))
+                execute("INSERT INTO inventory_transactions (item_id,transaction_type,quantity,reference,transaction_date,remarks) VALUES(?,?,?,?,?,?)", (pmap[item_name],"PURCHASE",qty,purchase_no,str(purchase_date),remarks))
+                st.success("Purchase saved and stock updated.")
+                st.rerun()
+    st.divider()
+    pr = query("SELECT p.id,p.purchase_no,p.purchase_date,v.name vendor,p.item_name,p.quantity,p.unit,p.rate,p.subtotal,p.gst_amount,p.total,p.payment_mode FROM purchases p LEFT JOIN vendors v ON p.vendor_id=v.id ORDER BY p.purchase_date DESC,p.id DESC")
+    st.dataframe(pr,use_container_width=True)
+
+
+# ============================================================
+# EXPENSES
+# ============================================================
+
+elif menu == "Expenses":
+    st.title("💸 Daily Expenses")
+    st.caption("Har daily kharch ki entry karein. Month-end par total expense aur profit automatically calculate hoga.")
+    categories = ["Office","Electricity","Internet / Mobile","Travel / Fuel","Vehicle","Rent","Repair & Maintenance","Tools","Stationery","Salary Related","Food","Bank Charges","Marketing","Other"]
+    with st.form("daily_expense"):
+        c1,c2,c3 = st.columns(3)
+        expense_date = c1.date_input("Expense Date", date.today())
+        category = c2.selectbox("Expense Category", categories)
+        amount = c3.number_input("Amount", min_value=0.0, step=100.0)
+        description = st.text_input("Description")
+        c1,c2 = st.columns(2)
+        payment_mode = c1.selectbox("Payment Mode", ["Cash","Bank","UPI","Cheque","Card","Other"])
+        reference = c2.text_input("Reference / Bill No.")
+        remarks = st.text_area("Remarks")
+        save = st.form_submit_button("💾 SAVE DAILY EXPENSE", type="primary", use_container_width=True)
+        if save:
+            if amount <= 0:
+                st.error("Amount must be greater than zero.")
+            else:
+                eno = f"EXP-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                execute("INSERT INTO expenses (expense_no,expense_date,category,description,amount,payment_mode,reference,remarks,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (eno,str(expense_date),category,description,amount,payment_mode,reference,remarks,now()))
+                st.success("Expense saved.")
+                st.rerun()
+    st.divider()
+    ex = query("SELECT id,expense_no,expense_date,category,description,amount,payment_mode,reference,remarks FROM expenses ORDER BY expense_date DESC,id DESC")
+    st.dataframe(ex,use_container_width=True)
+    if len(ex): st.success(f"Total recorded expenses: {money(ex['amount'].sum())}")
 
 
 # ============================================================
@@ -3146,6 +2793,10 @@ elif menu == "Reports":
             "Challans",
             "Invoices",
             "Payments",
+            "Purchases",
+            "Expenses",
+            "Monthly Profit & Loss",
+            "Daily Financial Summary",
             "Credit Notes",
             "Salary"
         ]
@@ -3240,6 +2891,49 @@ elif menu == "Reports":
         ORDER BY p.id DESC
         """,
 
+        "Purchases":
+        """
+        SELECT p.*, v.name vendor
+        FROM purchases p
+        LEFT JOIN vendors v ON p.vendor_id=v.id
+        ORDER BY p.purchase_date DESC,p.id DESC
+        """,
+
+        "Expenses":
+        "SELECT * FROM expenses ORDER BY expense_date DESC,id DESC",
+
+        "Monthly Profit & Loss":
+        """
+        SELECT m.month, m.sales, m.purchases, m.expenses, m.salary,
+               (m.sales-m.purchases-m.expenses-m.salary) profit, m.collections
+        FROM (
+            SELECT months.month,
+              COALESCE((SELECT SUM(MAX(i.subtotal-i.discount,0)) FROM invoices i WHERE substr(i.invoice_date,1,7)=months.month),0) sales,
+              COALESCE((SELECT SUM(p.subtotal) FROM purchases p WHERE substr(p.purchase_date,1,7)=months.month),0) purchases,
+              COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE substr(e.expense_date,1,7)=months.month),0) expenses,
+              COALESCE((SELECT SUM(s.gross_salary) FROM salary s WHERE substr(s.salary_month,1,7)=months.month),0) salary,
+              COALESCE((SELECT SUM(pay.amount) FROM payments pay WHERE substr(pay.payment_date,1,7)=months.month),0) collections
+            FROM (SELECT DISTINCT substr(invoice_date,1,7) month FROM invoices WHERE invoice_date IS NOT NULL
+                  UNION SELECT DISTINCT substr(purchase_date,1,7) FROM purchases WHERE purchase_date IS NOT NULL
+                  UNION SELECT DISTINCT substr(expense_date,1,7) FROM expenses WHERE expense_date IS NOT NULL
+                  UNION SELECT DISTINCT substr(salary_month,1,7) FROM salary WHERE salary_month IS NOT NULL
+                  UNION SELECT DISTINCT substr(payment_date,1,7) FROM payments WHERE payment_date IS NOT NULL) months
+        ) m
+        ORDER BY m.month DESC
+        """,
+
+        "Daily Financial Summary":
+        """
+        SELECT d.day,
+          COALESCE((SELECT SUM(MAX(i.subtotal-i.discount,0)) FROM invoices i WHERE i.invoice_date=d.day),0) sales,
+          COALESCE((SELECT SUM(p.subtotal) FROM purchases p WHERE p.purchase_date=d.day),0) purchases,
+          COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE e.expense_date=d.day),0) expenses,
+          0 salary,
+          COALESCE((SELECT SUM(pay.amount) FROM payments pay WHERE pay.payment_date=d.day),0) collections
+        FROM (SELECT DISTINCT invoice_date day FROM invoices UNION SELECT DISTINCT purchase_date FROM purchases UNION SELECT DISTINCT expense_date FROM expenses UNION SELECT DISTINCT payment_date FROM payments) d
+        ORDER BY d.day DESC
+        """,
+
         "Credit Notes":
         """
         SELECT
@@ -3261,7 +2955,33 @@ elif menu == "Reports":
         """
     }
 
-    df = query(reports[report])
+    # Financial reports get a month selector + KPI summary.
+    if report in ["Monthly Profit & Loss", "Daily Financial Summary"]:
+        available_months = query("""
+            SELECT month FROM (
+                SELECT DISTINCT substr(invoice_date,1,7) month FROM invoices WHERE invoice_date IS NOT NULL
+                UNION SELECT DISTINCT substr(purchase_date,1,7) FROM purchases WHERE purchase_date IS NOT NULL
+                UNION SELECT DISTINCT substr(expense_date,1,7) FROM expenses WHERE expense_date IS NOT NULL
+                UNION SELECT DISTINCT substr(salary_month,1,7) FROM salary WHERE salary_month IS NOT NULL
+                UNION SELECT DISTINCT substr(payment_date,1,7) FROM payments WHERE payment_date IS NOT NULL
+            ) WHERE month IS NOT NULL ORDER BY month DESC
+        """)
+        selected_month = st.selectbox("Select Month", list(available_months["month"]) if len(available_months) else [date.today().strftime("%Y-%m")])
+        if report == "Monthly Profit & Loss":
+            m_sales = float(one("SELECT COALESCE(SUM(MAX(subtotal-discount,0)),0) v FROM invoices WHERE substr(invoice_date,1,7)=?",(selected_month,))["v"] or 0)
+            m_purchase = float(one("SELECT COALESCE(SUM(subtotal),0) v FROM purchases WHERE substr(purchase_date,1,7)=?",(selected_month,))["v"] or 0)
+            m_expense = float(one("SELECT COALESCE(SUM(amount),0) v FROM expenses WHERE substr(expense_date,1,7)=?",(selected_month,))["v"] or 0)
+            m_salary = float(one("SELECT COALESCE(SUM(gross_salary),0) v FROM salary WHERE substr(salary_month,1,7)=?",(selected_month,))["v"] or 0)
+            m_collection = float(one("SELECT COALESCE(SUM(amount),0) v FROM payments WHERE substr(payment_date,1,7)=?",(selected_month,))["v"] or 0)
+            m_cash = float(one("SELECT COALESCE(SUM(amount),0) v FROM payments WHERE substr(payment_date,1,7)=? AND lower(mode)='cash'",(selected_month,))["v"] or 0)
+            m_bank = float(one("SELECT COALESCE(SUM(amount),0) v FROM payments WHERE substr(payment_date,1,7)=? AND lower(mode) IN ('bank received','bank','upi','cheque','card')",(selected_month,))["v"] or 0)
+            m_profit = m_sales-m_purchase-m_expense-m_salary
+            k1,k2,k3,k4,k5,k6 = st.columns(6)
+            k1.metric("Sales",money(m_sales)); k2.metric("Purchase",money(m_purchase)); k3.metric("Expenses",money(m_expense)); k4.metric("Salary",money(m_salary)); k5.metric("Collection",money(m_collection)); k6.metric("Profit",money(m_profit))
+            st.info(f"Cash Collection: {money(m_cash)}  |  Bank / UPI / Cheque / Card: {money(m_bank)}  |  Profit = Sales - Purchase - Expenses - Salary")
+            df = df[df["month"] == selected_month] if len(df) else df
+        else:
+            df = df[df["day"].astype(str).str.startswith(str(selected_month))] if len(df) else df
 
     st.dataframe(
         df,
