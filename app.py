@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 import calendar
 import hashlib
+import math
 from io import BytesIO
 
 # ReportLab is loaded lazily inside the PDF generator so the CRM can still start
@@ -85,6 +86,22 @@ def now():
 
 def money(v):
     return f"₹{float(v or 0):,.2f}"
+
+
+# ============================================================
+# LOCATION / GEO-FENCE HELPERS
+# ============================================================
+def distance_meters(lat1, lon1, lat2, lon2):
+    """Great-circle distance between two GPS coordinates in meters."""
+    try:
+        r = 6371000.0
+        p1, p2 = math.radians(float(lat1)), math.radians(float(lat2))
+        dp = math.radians(float(lat2) - float(lat1))
+        dl = math.radians(float(lon2) - float(lon1))
+        a = math.sin(dp/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dl/2)**2
+        return 2 * r * math.asin(math.sqrt(a))
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -499,6 +516,7 @@ def init_db():
         whatsapp_api_version TEXT DEFAULT 'v23.0',
         whatsapp_language TEXT DEFAULT 'en_US',
         whatsapp_notify_punch INTEGER DEFAULT 1,
+        whatsapp_notify_attendance_admin INTEGER DEFAULT 1,
         whatsapp_notify_salary INTEGER DEFAULT 1,
         whatsapp_notify_service INTEGER DEFAULT 1,
         whatsapp_notify_invoice INTEGER DEFAULT 1,
@@ -555,6 +573,8 @@ def init_db():
         joining_date TEXT,
         address TEXT,
         active INTEGER DEFAULT 1,
+        login_username TEXT UNIQUE,
+        login_password TEXT,
         created_at TEXT
     );
 
@@ -563,6 +583,8 @@ def init_db():
         call_no TEXT,
         client_id INTEGER,
         site TEXT,
+        site_latitude REAL,
+        site_longitude REAL,
         complaint TEXT,
         priority TEXT,
         engineer_id INTEGER,
@@ -812,6 +834,7 @@ def init_db():
             "whatsapp_api_version": "TEXT DEFAULT 'v23.0'",
             "whatsapp_language": "TEXT DEFAULT 'en_US'",
             "whatsapp_notify_punch": "INTEGER DEFAULT 1",
+            "whatsapp_notify_attendance_admin": "INTEGER DEFAULT 1",
             "whatsapp_notify_salary": "INTEGER DEFAULT 1",
             "whatsapp_notify_service": "INTEGER DEFAULT 1",
             "whatsapp_notify_invoice": "INTEGER DEFAULT 1",
@@ -860,12 +883,16 @@ def init_db():
             "joining_date": "TEXT",
             "address": "TEXT",
             "active": "INTEGER DEFAULT 1",
+            "login_username": "TEXT",
+            "login_password": "TEXT",
             "created_at": "TEXT",
         },
         "service_calls": {
             "call_no": "TEXT",
             "client_id": "INTEGER",
             "site": "TEXT",
+            "site_latitude": "REAL",
+            "site_longitude": "REAL",
             "complaint": "TEXT",
             "priority": "TEXT",
             "engineer_id": "INTEGER",
@@ -1068,93 +1095,96 @@ if "logged_in" not in st.session_state:
 if not st.session_state.logged_in:
 
     st.title("🏢 Pragati CRM")
+    tab_admin, tab_engineer = st.tabs(["🔐 Admin Login", "👷 Engineer Login"])
 
-    st.subheader("Admin Login")
+    with tab_admin:
+        with st.form("login"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            login = st.form_submit_button("Admin Login", use_container_width=True)
+            if login:
+                user = one("SELECT * FROM admins WHERE username=? AND password=? AND active=1", (username, password_hash(password)))
+                if user:
+                    st.session_state.logged_in = True
+                    st.session_state.user_role = "admin"
+                    st.session_state.admin_name = user["name"]
+                    st.rerun()
+                else:
+                    st.error("Invalid admin username or password.")
+        st.info("First login: Username: admin | Password: admin123")
 
-    with st.form("login"):
-
-        username = st.text_input("Username")
-        password = st.text_input(
-            "Password",
-            type="password"
-        )
-
-        login = st.form_submit_button(
-            "Login",
-            use_container_width=True
-        )
-
-        if login:
-
-            user = one("""
-                SELECT *
-                FROM admins
-                WHERE username=? AND password=? AND active=1
-            """, (
-                username,
-                password_hash(password)
-            ))
-
-            if user:
-
-                st.session_state.logged_in = True
-                st.session_state.admin_name = user["name"]
-                st.rerun()
-
-            else:
-                st.error("Invalid username or password.")
-
-    st.info(
-        "First login: Username: admin | Password: admin123"
-    )
+    with tab_engineer:
+        st.caption("Engineer login is created from Engineer / Technician Management.")
+        with st.form("engineer_login"):
+            euser = st.text_input("Engineer Username")
+            epass = st.text_input("Password", type="password")
+            elogin = st.form_submit_button("Engineer Login", use_container_width=True)
+            if elogin:
+                eng_user = one("SELECT * FROM engineers WHERE login_username=? AND login_password=? AND active=1", (euser.strip(), password_hash(epass)))
+                if eng_user:
+                    st.session_state.logged_in = True
+                    st.session_state.user_role = "engineer"
+                    st.session_state.engineer_id = int(eng_user["id"])
+                    st.session_state.engineer_name = eng_user["name"]
+                    st.rerun()
+                else:
+                    st.error("Invalid engineer username/password or account is inactive.")
 
     st.stop()
-
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
 settings = one("SELECT * FROM settings WHERE id=1")
-
+role = st.session_state.get("user_role", "admin")
 st.sidebar.title("🏢 PRAGATI CRM")
 st.sidebar.caption(settings["company_name"])
-
-menu = st.sidebar.radio(
-    "MENU",
-    [
-        "Dashboard",
-        "Client Registration",
-        "Vendor Registration",
-        "Engineer / Technician",
-        "Service Calls",
-        "Attendance IN / OUT",
-        "AMC Management",
-        "Inventory",
-        "Quotation",
-        "Challan",
-        "Bill / Invoice",
-        "Payment Collection",
-        "Purchase Entry",
-        "Expenses",
-        "Credit Note",
-        "Auto Adjustment",
-        "Salary / Payroll",
-        "Admin T&C",
-        "Reports"
-    ]
-)
-
+if role == "engineer":
+    st.sidebar.success(f"👷 {st.session_state.get('engineer_name','Engineer')}")
+    menu = st.sidebar.radio("MENU", ["Engineer Dashboard", "Attendance IN / OUT", "My Service Calls"])
+else:
+    menu = st.sidebar.radio("MENU", [
+        "Dashboard", "Client Registration", "Vendor Registration", "Engineer / Technician",
+        "Service Calls", "Attendance IN / OUT", "AMC Management", "Inventory", "Quotation",
+        "Challan", "Bill / Invoice", "Payment Collection", "Purchase Entry", "Expenses",
+        "Credit Note", "Auto Adjustment", "Salary / Payroll", "Admin T&C", "Reports"
+    ])
 if st.sidebar.button("Logout"):
-    st.session_state.logged_in = False
+    for k in ["logged_in", "user_role", "engineer_id", "engineer_name", "admin_name"]:
+        st.session_state.pop(k, None)
     st.rerun()
 
+
+# ============================================================
+# ENGINEER DASHBOARD
+# ============================================================
+
+if menu == "Engineer Dashboard" and role == "engineer":
+    eid = int(st.session_state.engineer_id)
+    st.title("👷 Engineer Dashboard")
+    eng = one("SELECT * FROM engineers WHERE id=?", (eid,))
+    today = str(date.today())
+    att = one("SELECT * FROM attendance WHERE engineer_id=? AND attendance_date=?", (eid, today))
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Today", today)
+    c2.metric("IN", att["in_time"] if att and att["in_time"] else "-")
+    c3.metric("OUT", att["out_time"] if att and att["out_time"] else "-")
+    c4.metric("Hours", f"{float(att['hours'] or 0):.2f}" if att else "0.00")
+    st.subheader("📋 Assigned Service Calls")
+    mycalls=query("SELECT call_no,site,site_latitude,site_longitude,scheduled_date,priority,status,complaint FROM service_calls WHERE engineer_id=? ORDER BY scheduled_date DESC,id DESC", (eid,))
+    st.dataframe(mycalls, use_container_width=True)
+
+elif menu == "My Service Calls" and role == "engineer":
+    eid = int(st.session_state.engineer_id)
+    st.title("🛠️ My Service Calls")
+    st.dataframe(query("SELECT call_no,site,scheduled_date,priority,status,complaint,remarks FROM service_calls WHERE engineer_id=? ORDER BY scheduled_date DESC,id DESC", (eid,)), use_container_width=True)
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
-if menu == "Dashboard":
+if menu == "Dashboard" and role == "admin":
 
     st.title("📊 Dashboard")
 
@@ -1341,6 +1371,7 @@ elif menu == "Engineer / Technician":
     st.title("👷 Engineer / Technician Management")
     with st.form("engineer"):
         c1,c2,c3=st.columns(3); name=c1.text_input("Engineer Name *"); mobile=c2.text_input("Mobile"); email=c3.text_input("Email")
+        c1,c2=st.columns(2); login_username=c1.text_input("Login Username *"); login_password=c2.text_input("Login Password *", type="password")
         c1,c2,c3=st.columns(3); designation=c1.text_input("Designation","Service Engineer"); salary_type=c2.selectbox("Salary Type",["Monthly","Daily"]); salary=c3.number_input("Monthly Salary",min_value=0.0,step=500.0)
         daily_rate=st.number_input("Daily Rate",min_value=0.0,step=100.0)
         c1,c2,c3=st.columns(3); working_days=c1.number_input("Salary Working Days / Month",1.0,31.0,26.0,1.0); standard_hours=c2.number_input("Standard Hours / Day",1.0,24.0,8.0,.5); ot_rate=c3.number_input("OT Rate / Hour",0.0,step=10.0)
@@ -1348,8 +1379,9 @@ elif menu == "Engineer / Technician":
         save=st.form_submit_button("➕ Add Engineer",use_container_width=True)
         if save:
             if not name.strip(): st.error("Engineer name required.")
+            elif not login_username.strip() or not login_password: st.error("Engineer login username and password are required.")
             else:
-                execute("""INSERT INTO engineers (name,mobile,email,designation,salary_type,salary,daily_rate,working_days,standard_hours,ot_rate,ot_multiplier,joining_date,address,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(name,mobile,email,designation,salary_type,salary,daily_rate,working_days,standard_hours,ot_rate,ot_multiplier,str(joining_date),address,now())); st.success("Engineer added."); st.rerun()
+                execute("""INSERT INTO engineers (name,mobile,email,designation,salary_type,salary,daily_rate,working_days,standard_hours,ot_rate,ot_multiplier,joining_date,address,login_username,login_password,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(name,mobile,email,designation,salary_type,salary,daily_rate,working_days,standard_hours,ot_rate,ot_multiplier,str(joining_date),address,login_username.strip(),password_hash(login_password),now())); st.success("Engineer added with login access."); st.rerun()
     st.divider(); st.subheader("✏️ Edit / Update Technician")
     edf=query("SELECT * FROM engineers ORDER BY name")
     if len(edf):
@@ -1359,9 +1391,10 @@ elif menu == "Engineer / Technician":
             c1,c2,c3=st.columns(3); edes=c1.text_input("Designation",r["designation"] or ""); estype=c2.selectbox("Salary Type",["Monthly","Daily"],index=0 if (r["salary_type"] or "Monthly")=="Monthly" else 1); esalary=c3.number_input("Monthly Salary",min_value=0.0,value=float(r["salary"] or 0),step=500.0)
             c1,c2,c3=st.columns(3); edaily=c1.number_input("Daily Rate",min_value=0.0,value=float(r["daily_rate"] or 0),step=100.0); ewd=c2.number_input("Working Days / Month",1.0,31.0,float(r["working_days"] or 26),1.0); esh=c3.number_input("Standard Hours / Day",1.0,24.0,float(r["standard_hours"] or 8),.5)
             c1,c2,c3=st.columns(3); eot=c1.number_input("OT Rate / Hour",min_value=0.0,value=float(r["ot_rate"] or 0),step=10.0); eom=c2.number_input("OT Multiplier",1.0,5.0,float(r["ot_multiplier"] or 1.5),.5); ejoin=c3.date_input("Joining Date",datetime.strptime(r["joining_date"],"%Y-%m-%d").date() if r["joining_date"] else date.today())
-            eaddress=st.text_area("Address",r["address"] or ""); active=st.checkbox("Active",value=bool(r["active"])); b1,b2=st.columns(2); update=b1.form_submit_button("💾 Update Technician",use_container_width=True); delete=b2.form_submit_button("🗑️ Delete Technician",use_container_width=True)
+            eaddress=st.text_area("Address",r["address"] or ""); c1,c2=st.columns(2); elogin_username=c1.text_input("Login Username",r["login_username"] or ""); elogin_password=c2.text_input("New Login Password (blank = keep)",type="password"); active=st.checkbox("Active",value=bool(r["active"])); b1,b2=st.columns(2); update=b1.form_submit_button("💾 Update Technician",use_container_width=True); delete=b2.form_submit_button("🗑️ Delete Technician",use_container_width=True)
             if update:
-                execute("""UPDATE engineers SET name=?,mobile=?,email=?,designation=?,salary_type=?,salary=?,daily_rate=?,working_days=?,standard_hours=?,ot_rate=?,ot_multiplier=?,joining_date=?,address=?,active=? WHERE id=?""",(ename,emobile,eemail,edes,estype,esalary,edaily,ewd,esh,eot,eom,str(ejoin),eaddress,int(active),eid)); st.success("Technician details updated."); st.rerun()
+                new_hash = password_hash(elogin_password) if elogin_password else r["login_password"]
+                execute("""UPDATE engineers SET name=?,mobile=?,email=?,designation=?,salary_type=?,salary=?,daily_rate=?,working_days=?,standard_hours=?,ot_rate=?,ot_multiplier=?,joining_date=?,address=?,login_username=?,login_password=?,active=? WHERE id=?""",(ename,emobile,eemail,edes,estype,esalary,edaily,ewd,esh,eot,eom,str(ejoin),eaddress,elogin_username.strip(),new_hash,int(active),eid)); st.success("Technician details updated."); st.rerun()
             if delete: execute("UPDATE engineers SET active=0 WHERE id=?",(eid,)); st.success("Technician deactivated."); st.rerun()
     st.dataframe(query("SELECT id,name,mobile,designation,salary_type,salary,daily_rate,working_days,standard_hours,ot_rate,ot_multiplier,joining_date,CASE WHEN active=1 THEN 'Active' ELSE 'Inactive' END status FROM engineers ORDER BY id DESC"),use_container_width=True)
 
@@ -1379,11 +1412,12 @@ elif menu == "Service Calls":
         cmap=dict(zip(clients.name,clients.id)); emap=dict(zip(engineers.name,engineers.id))
         with st.form("service_call"):
             call_no=st.text_input("Call No.",f"CALL-{datetime.now().strftime('%Y%m%d%H%M%S')}"); c1,c2=st.columns(2); client_name=c1.selectbox("Client",list(cmap)); engineer_name=c2.selectbox("Assign Engineer",list(emap))
-            c1,c2,c3=st.columns(3); site=c1.text_input("Site / Location"); priority=c2.selectbox("Priority",["Low","Medium","High","Emergency"]); status=c3.selectbox("Status",["Open","Assigned","Pending Process","In Progress","Completed","Cancelled"])
+            c1,c2,c3=st.columns(3); site=c1.text_input("Site / Location"); site_lat=c2.number_input("Site Latitude",format="%.7f",value=0.0); site_lon=c3.number_input("Site Longitude",format="%.7f",value=0.0)
+            c1,c2=st.columns(2); priority=c1.selectbox("Priority",["Low","Medium","High","Emergency"]); status=c2.selectbox("Status",["Open","Assigned","Pending Process","In Progress","Completed","Cancelled"])
             complaint=st.text_area("Complaint / Service Requirement"); c1,c2=st.columns(2); call_date=c1.date_input("Call Date",date.today()); scheduled_date=c2.date_input("Visit / Schedule Date",date.today()); material=st.text_input("Material Used"); remarks=st.text_area("Remarks")
             save=st.form_submit_button("📌 Assign & Save Call",use_container_width=True)
             if save:
-                execute("""INSERT INTO service_calls (call_no,client_id,site,complaint,priority,engineer_id,call_date,scheduled_date,status,material,remarks,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",(call_no,cmap[client_name],site,complaint,priority,emap[engineer_name],str(call_date),str(scheduled_date),status,material,remarks,now())); st.success(f"Call assigned to {engineer_name}"); st.rerun()
+                execute("""INSERT INTO service_calls (call_no,client_id,site,site_latitude,site_longitude,complaint,priority,engineer_id,call_date,scheduled_date,status,material,remarks,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(call_no,cmap[client_name],site,site_lat if site_lat else None,site_lon if site_lon else None,complaint,priority,emap[engineer_name],str(call_date),str(scheduled_date),status,material,remarks,now())); st.success(f"Call assigned to {engineer_name}"); st.rerun()
     st.divider(); st.subheader("✏️ Update Service Call")
     sdf=query("SELECT s.*,c.name client,e.name engineer FROM service_calls s LEFT JOIN clients c ON c.id=s.client_id LEFT JOIN engineers e ON e.id=s.engineer_id ORDER BY s.id DESC")
     if len(sdf):
@@ -1391,10 +1425,10 @@ elif menu == "Service Calls":
         clients_all=query("SELECT id,name FROM clients ORDER BY name"); eng_all=query("SELECT id,name FROM engineers ORDER BY name"); cmap2=dict(zip(clients_all.name,clients_all.id)); emap2=dict(zip(eng_all.name,eng_all.id))
         with st.form("edit_service"):
             c1,c2,c3=st.columns(3); eclient=c1.selectbox("Client",list(cmap2),index=list(cmap2.values()).index(int(r["client_id"])) if int(r["client_id"] or 0) in list(cmap2.values()) else 0); eeng=c2.selectbox("Technician",list(emap2),index=list(emap2.values()).index(int(r["engineer_id"])) if r["engineer_id"] and int(r["engineer_id"]) in list(emap2.values()) else 0); estat=c3.selectbox("Status",["Open","Assigned","Pending Process","In Progress","Completed","Cancelled"],index=["Open","Assigned","Pending Process","In Progress","Completed","Cancelled"].index(r["status"]) if r["status"] in ["Open","Assigned","Pending Process","In Progress","Completed","Cancelled"] else 0)
-            esite=st.text_input("Site / Location",r["site"] or ""); epriority=st.selectbox("Priority",["Low","Medium","High","Emergency"],index=["Low","Medium","High","Emergency"].index(r["priority"]) if r["priority"] in ["Low","Medium","High","Emergency"] else 0); ecomplaint=st.text_area("Complaint",r["complaint"] or ""); ematerial=st.text_input("Material Used",r["material"] or ""); eremarks=st.text_area("Remarks",r["remarks"] or ""); ecust=st.text_area("Customer Feedback",r["customer_feedback"] or "")
+            c1,c2=st.columns(2); esite=c1.text_input("Site / Location",r["site"] or ""); esite_lat=c2.number_input("Site Latitude",format="%.7f",value=float(r["site_latitude"] or 0)); esite_lon=st.number_input("Site Longitude",format="%.7f",value=float(r["site_longitude"] or 0)); epriority=st.selectbox("Priority",["Low","Medium","High","Emergency"],index=["Low","Medium","High","Emergency"].index(r["priority"]) if r["priority"] in ["Low","Medium","High","Emergency"] else 0); ecomplaint=st.text_area("Complaint",r["complaint"] or ""); ematerial=st.text_input("Material Used",r["material"] or ""); eremarks=st.text_area("Remarks",r["remarks"] or ""); ecust=st.text_area("Customer Feedback",r["customer_feedback"] or "")
             update=st.form_submit_button("💾 UPDATE / CLOSE CALL",type="primary",use_container_width=True)
             if update:
-                execute("""UPDATE service_calls SET client_id=?,site=?,complaint=?,priority=?,engineer_id=?,status=?,material=?,remarks=?,customer_feedback=? WHERE id=?""",(cmap2[eclient],esite,ecomplaint,epriority,emap2[eeng],estat,ematerial,eremarks,ecust,sid)); st.success(f"Service Call {r['call_no']} updated to {estat}."); st.rerun()
+                execute("""UPDATE service_calls SET client_id=?,site=?,site_latitude=?,site_longitude=?,complaint=?,priority=?,engineer_id=?,status=?,material=?,remarks=?,customer_feedback=? WHERE id=?""",(cmap2[eclient],esite,esite_lat if esite_lat else None,esite_lon if esite_lon else None,ecomplaint,epriority,emap2[eeng],estat,ematerial,eremarks,ecust,sid)); st.success(f"Service Call {r['call_no']} updated to {estat}."); st.rerun()
     st.dataframe(sdf[["id","call_no","client","site","priority","engineer","scheduled_date","status"]] if len(sdf) else sdf,use_container_width=True)
     if len(sdf):
         st.subheader("🖨️ Printable Service Report PDF"); opts=[f"{r.call_no} | {r.client} | {r.call_date}" for _,r in sdf.iterrows()]; sel=st.selectbox("Select service call to print",opts,key="print_service_report"); row=sdf.iloc[opts.index(sel)]; st.download_button("🖨️ Download / Print Service Report PDF",service_call_pdf(row),f"service_report_{row['call_no']}.pdf","application/pdf",use_container_width=True,key="download_service_report_pdf")
@@ -1408,202 +1442,77 @@ elif menu == "Attendance IN / OUT":
 
     st.title("🕘 Engineer Attendance")
 
-    engineers = query("""
-        SELECT id,name
-        FROM engineers
-        WHERE active=1
-        ORDER BY name
-    """)
-
-    if len(engineers) == 0:
-
-        st.warning("No active engineers.")
-
+    if role == "engineer":
+        engineer_id = int(st.session_state.engineer_id)
+        eng = one("SELECT * FROM engineers WHERE id=?", (engineer_id,))
+        st.caption(f"Logged in as: {eng['name']}")
+        assigned = query("SELECT id,call_no,site,site_latitude,site_longitude,scheduled_date FROM service_calls WHERE engineer_id=? AND status NOT IN ('Completed','Cancelled') ORDER BY scheduled_date DESC,id DESC", (engineer_id,))
+        if len(assigned):
+            labels=[f"{r['call_no']} | {r['site'] or 'Site'} | {r['scheduled_date']}" for _,r in assigned.iterrows()]
+            sel=st.selectbox("Select assigned site for attendance",labels)
+            site_row=assigned.iloc[labels.index(sel)]
+            if not site_row['site_latitude'] or not site_row['site_longitude']:
+                st.error("This site does not have GPS coordinates. Admin must add Site Latitude and Site Longitude in Service Calls.")
+            else:
+                try:
+                    from streamlit_geolocation import streamlit_geolocation
+                    loc=streamlit_geolocation()
+                except Exception:
+                    loc=None
+                    st.error("Location module is not installed. Add streamlit-geolocation to requirements.txt.")
+                if loc and isinstance(loc,dict) and loc.get('latitude') is not None:
+                    dist=distance_meters(loc['latitude'],loc['longitude'],site_row['site_latitude'],site_row['site_longitude'])
+                    st.info(f"Your GPS accuracy: {float(loc.get('accuracy') or 0):.1f} m | Distance from site: {dist:.1f} m")
+                    within = dist is not None and dist <= 100
+                    if within: st.success("✅ You are within the 100 meter site radius.")
+                    else: st.error("❌ You are outside the 100 meter site radius. Attendance punch is blocked.")
+                    existing=one("SELECT * FROM attendance WHERE engineer_id=? AND attendance_date=?",(engineer_id,str(date.today())))
+                    c1,c2=st.columns(2)
+                    if c1.button("🟢 IN PUNCH",disabled=not within,use_container_width=True):
+                        current_time=datetime.now().strftime("%H:%M:%S")
+                        if existing: execute("UPDATE attendance SET in_time=?,status='Present',remarks=? WHERE id=?",(current_time,f"GPS {loc['latitude']},{loc['longitude']} | {dist:.1f}m from site",existing['id']))
+                        else: execute("INSERT INTO attendance (engineer_id,attendance_date,in_time,status,remarks) VALUES(?,?,?,'Present',?)",(engineer_id,str(date.today()),current_time,f"GPS {loc['latitude']},{loc['longitude']} | {dist:.1f}m from site"))
+                        if eng['mobile']:
+                            whatsapp_notify("punch_in",eng['mobile'],[eng['name'],str(date.today()),current_time])
+                        admin_phone=_setting_value("phone","")
+                        if int(_setting_value("whatsapp_notify_attendance_admin",1) or 0)==1 and admin_phone:
+                            whatsapp_notify("punch_in",admin_phone,[f"ADMIN: {eng['name']}",str(date.today()),current_time])
+                        st.success(f"IN Punch recorded at {current_time}"); st.rerun()
+                    if c2.button("🔴 OUT PUNCH",disabled=not within,use_container_width=True):
+                        current_time=datetime.now().strftime("%H:%M:%S")
+                        record=one("SELECT * FROM attendance WHERE engineer_id=? AND attendance_date=?",(engineer_id,str(date.today())))
+                        if not record or not record['in_time']: st.error("First perform IN Punch.")
+                        else:
+                            in_dt=datetime.strptime(record['in_time'],"%H:%M:%S"); out_dt=datetime.strptime(current_time,"%H:%M:%S"); seconds=(out_dt-in_dt).total_seconds(); seconds += 86400 if seconds<0 else 0; hours=seconds/3600
+                            execute("UPDATE attendance SET out_time=?,hours=?,remarks=? WHERE id=?",(current_time,hours,f"GPS {loc['latitude']},{loc['longitude']} | {dist:.1f}m from site",record['id']))
+                            if eng['mobile']: whatsapp_notify("punch_out",eng['mobile'],[eng['name'],str(date.today()),current_time,f"{hours:.2f}"])
+                            admin_phone=_setting_value("phone","")
+                            if int(_setting_value("whatsapp_notify_attendance_admin",1) or 0)==1 and admin_phone:
+                                whatsapp_notify("punch_out",admin_phone,[f"ADMIN: {eng['name']}",str(date.today()),current_time,f"{hours:.2f}"])
+                            st.success(f"OUT Punch recorded at {current_time} | {hours:.2f} hours"); st.rerun()
+        else: st.warning("No assigned active service site found for you.")
     else:
-
-        engineer_map = dict(
-            zip(engineers["name"], engineers["id"])
-        )
-
-        selected = st.selectbox(
-            "Engineer",
-            list(engineer_map.keys())
-        )
-
-        engineer_id = engineer_map[selected]
-
-        attendance_date = st.date_input(
-            "Attendance Date",
-            date.today()
-        )
-
-        existing = one("""
-            SELECT *
-            FROM attendance
-            WHERE engineer_id=?
-            AND attendance_date=?
-        """, (
-            engineer_id,
-            str(attendance_date)
-        ))
-
-        if existing:
-
-            c1,c2,c3 = st.columns(3)
-
-            c1.metric(
-                "IN",
-                existing["in_time"] or "-"
-            )
-
-            c2.metric(
-                "OUT",
-                existing["out_time"] or "-"
-            )
-
-            c3.metric(
-                "Hours",
-                f"{existing['hours'] or 0:.2f}"
-            )
-
-        st.divider()
-
-        c1,c2 = st.columns(2)
-
-        if c1.button(
-            "🟢 IN PUNCH",
-            use_container_width=True
-        ):
-
-            current_time = datetime.now().strftime(
-                "%H:%M:%S"
-            )
-
-            if existing:
-
-                execute("""
-                    UPDATE attendance
-                    SET in_time=?, status='Present'
-                    WHERE id=?
-                """, (
-                    current_time,
-                    existing["id"]
-                ))
-
-            else:
-
-                execute("""
-                    INSERT INTO attendance
-                    (engineer_id,attendance_date,
-                     in_time,status)
-                    VALUES(?,?,?,'Present')
-                """, (
-                    engineer_id,
-                    str(attendance_date),
-                    current_time
-                ))
-
-            st.success(
-                f"IN Punch: {current_time}"
-            )
-            eng = one("SELECT name,mobile FROM engineers WHERE id=?", (engineer_id,))
-            if eng and eng["mobile"]:
-                ok, msg = whatsapp_notify("punch_in", eng["mobile"], [eng["name"], str(attendance_date), current_time])
-                if ok:
-                    st.info("WhatsApp IN notification sent.")
-                elif whatsapp_configured()[0] and "Template not configured" not in msg:
-                    st.warning(f"WhatsApp notification: {msg}")
-
-            st.rerun()
-
-        if c2.button(
-            "🔴 OUT PUNCH",
-            use_container_width=True
-        ):
-
-            current_time = datetime.now().strftime(
-                "%H:%M:%S"
-            )
-
-            record = one("""
-                SELECT *
-                FROM attendance
-                WHERE engineer_id=?
-                AND attendance_date=?
-            """, (
-                engineer_id,
-                str(attendance_date)
-            ))
-
-            if not record or not record["in_time"]:
-
-                st.error(
-                    "First perform IN Punch."
-                )
-
-            else:
-
-                in_dt = datetime.strptime(
-                    record["in_time"],
-                    "%H:%M:%S"
-                )
-
-                out_dt = datetime.strptime(
-                    current_time,
-                    "%H:%M:%S"
-                )
-
-                seconds = (
-                    out_dt - in_dt
-                ).total_seconds()
-
-                if seconds < 0:
-                    seconds += 86400
-
-                hours = seconds / 3600
-
-                execute("""
-                    UPDATE attendance
-                    SET out_time=?, hours=?
-                    WHERE id=?
-                """, (
-                    current_time,
-                    hours,
-                    record["id"]
-                ))
-
-                st.success(
-                    f"OUT Punch: {current_time} | "
-                    f"Working Hours: {hours:.2f}"
-                )
-                eng = one("SELECT name,mobile FROM engineers WHERE id=?", (engineer_id,))
-                if eng and eng["mobile"]:
-                    ok, msg = whatsapp_notify("punch_out", eng["mobile"], [eng["name"], str(attendance_date), current_time, f"{hours:.2f}"])
-                    if ok:
-                        st.info("WhatsApp OUT notification sent.")
-                    elif whatsapp_configured()[0] and "Template not configured" not in msg:
-                        st.warning(f"WhatsApp notification: {msg}")
-
-                st.rerun()
+        st.subheader("👨‍💼 Admin Manual Attendance")
+        engineers=query("SELECT id,name FROM engineers WHERE active=1 ORDER BY name")
+        if len(engineers):
+            emap=dict(zip(engineers.name,engineers.id)); selected=st.selectbox("Engineer",list(emap.keys()),key="admin_att_engineer"); engineer_id=emap[selected]
+            attendance_date=st.date_input("Attendance Date",date.today(),key="admin_att_date")
+            existing=one("SELECT * FROM attendance WHERE engineer_id=? AND attendance_date=?",(engineer_id,str(attendance_date)))
+            c1,c2=st.columns(2); manual_in=c1.time_input("Manual IN Time",datetime.strptime(existing['in_time'],"%H:%M:%S").time() if existing and existing['in_time'] else datetime.now().time(),key="manual_in"); manual_out=c2.time_input("Manual OUT Time",datetime.strptime(existing['out_time'],"%H:%M:%S").time() if existing and existing['out_time'] else datetime.now().time(),key="manual_out")
+            remarks=st.text_input("Admin Remarks",existing['remarks'] if existing else "")
+            if st.button("💾 SAVE MANUAL ATTENDANCE",use_container_width=True):
+                in_time=manual_in.strftime("%H:%M:%S"); out_time=manual_out.strftime("%H:%M:%S"); in_dt=datetime.combine(attendance_date,manual_in); out_dt=datetime.combine(attendance_date,manual_out); seconds=(out_dt-in_dt).total_seconds(); seconds += 86400 if seconds<0 else 0; hours=seconds/3600
+                if existing: execute("UPDATE attendance SET in_time=?,out_time=?,hours=?,status='Present',remarks=? WHERE id=?",(in_time,out_time,hours,remarks,existing['id']))
+                else: execute("INSERT INTO attendance (engineer_id,attendance_date,in_time,out_time,hours,status,remarks) VALUES(?,?,?,?,?,'Present',?)",(engineer_id,str(attendance_date),in_time,out_time,hours,remarks))
+                eng=one("SELECT name,mobile FROM engineers WHERE id=?",(engineer_id,))
+                if eng and eng['mobile']:
+                    whatsapp_notify("punch_in",eng['mobile'],[eng['name'],str(attendance_date),in_time]); whatsapp_notify("punch_out",eng['mobile'],[eng['name'],str(attendance_date),out_time,f"{hours:.2f}"])
+                st.success("Manual attendance saved and WhatsApp notification processed."); st.rerun()
+        else: st.warning("No active engineers.")
 
     st.divider()
-
-    df = query("""
-        SELECT
-            a.attendance_date,
-            e.name engineer,
-            a.in_time,
-            a.out_time,
-            a.hours,
-            a.status,
-            a.remarks
-        FROM attendance a
-        LEFT JOIN engineers e
-            ON a.engineer_id=e.id
-        ORDER BY a.attendance_date DESC
-    """)
-
-    st.dataframe(df, use_container_width=True)
+    df=query("SELECT a.attendance_date,e.name engineer,a.in_time,a.out_time,a.hours,a.status,a.remarks FROM attendance a LEFT JOIN engineers e ON a.engineer_id=e.id ORDER BY a.attendance_date DESC")
+    st.dataframe(df,use_container_width=True)
 
 
 # ============================================================
@@ -2695,12 +2604,13 @@ elif menu == "Admin T&C":
     c1,c2 = st.columns(2)
     wa_t_invoice = c1.text_input("Invoice template", _setting_value("whatsapp_template_invoice", "invoice_generated"))
     wa_t_amc = c2.text_input("AMC template", _setting_value("whatsapp_template_amc", "amc_reminder"))
-    c1,c2,c3,c4,c5 = st.columns(5)
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
     wa_n_punch = c1.checkbox("Punch", value=bool(_setting_value("whatsapp_notify_punch", 1)))
-    wa_n_salary = c2.checkbox("Salary", value=bool(_setting_value("whatsapp_notify_salary", 1)))
-    wa_n_service = c3.checkbox("Service", value=bool(_setting_value("whatsapp_notify_service", 1)))
-    wa_n_invoice = c4.checkbox("Invoice", value=bool(_setting_value("whatsapp_notify_invoice", 1)))
-    wa_n_amc = c5.checkbox("AMC", value=bool(_setting_value("whatsapp_notify_amc", 1)))
+    wa_n_att_admin = c2.checkbox("Attendance Admin", value=bool(_setting_value("whatsapp_notify_attendance_admin", 1)))
+    wa_n_salary = c3.checkbox("Salary", value=bool(_setting_value("whatsapp_notify_salary", 1)))
+    wa_n_service = c4.checkbox("Service", value=bool(_setting_value("whatsapp_notify_service", 1)))
+    wa_n_invoice = c5.checkbox("Invoice", value=bool(_setting_value("whatsapp_notify_invoice", 1)))
+    wa_n_amc = c6.checkbox("AMC", value=bool(_setting_value("whatsapp_notify_amc", 1)))
 
     test_number = st.text_input("Test WhatsApp number", placeholder="10-digit Indian mobile or full country code")
     if st.button("📲 SEND TEST WHATSAPP", use_container_width=True):
@@ -2736,6 +2646,7 @@ elif menu == "Admin T&C":
                 whatsapp_api_version=?,
                 whatsapp_language=?,
                 whatsapp_notify_punch=?,
+                whatsapp_notify_attendance_admin=?,
                 whatsapp_notify_salary=?,
                 whatsapp_notify_service=?,
                 whatsapp_notify_invoice=?,
@@ -2758,7 +2669,7 @@ elif menu == "Admin T&C":
             challan_terms,
             service_terms,
             int(wa_enabled), wa_phone_id, wa_token, wa_api_version, wa_language,
-            int(wa_n_punch), int(wa_n_salary), int(wa_n_service), int(wa_n_invoice), int(wa_n_amc),
+            int(wa_n_punch), int(wa_n_att_admin), int(wa_n_salary), int(wa_n_service), int(wa_n_invoice), int(wa_n_amc),
             wa_t_in, wa_t_out, wa_t_salary, wa_t_service, wa_t_invoice, wa_t_amc
         ))
 
@@ -2953,6 +2864,10 @@ elif menu == "Reports":
         ORDER BY s.id DESC
         """
     }
+
+    # Run the selected report query before applying any report-specific filters.
+    # This also guarantees `df` exists for the dataframe/download section below.
+    df = query(reports[report])
 
     # Financial reports get a month selector + KPI summary.
     if report in ["Monthly Profit & Loss", "Daily Financial Summary"]:
