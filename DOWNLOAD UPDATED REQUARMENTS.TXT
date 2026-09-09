@@ -1,0 +1,6 @@
+streamlit
+pandas
+reportlab
+requests
+
+streamlit-geolocation
